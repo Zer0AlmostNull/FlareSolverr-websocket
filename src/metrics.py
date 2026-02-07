@@ -15,6 +15,18 @@ REQUEST_DURATION = Histogram(
     buckets=[0, 10, 25, 50]
 )
 
+WEBSOCKET_LOGGER_SESSION_TOTAL = Counter(
+    name='flaresolverr_websocket_logger_session_total',
+    documentation='Total successfully established websocket logger sessions',
+    labelnames=['url']
+)
+
+WEBSOCKET_BYTES_RECEIVED_TOTAL = Counter(
+    name='flaresolverr_websocket_bytes_received_total',
+    documentation='Total bytes received from websocket connections',
+    labelnames=['url']
+)
+
 
 def serve(port):
     start_http_server(port=port)

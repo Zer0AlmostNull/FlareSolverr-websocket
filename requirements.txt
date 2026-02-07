@@ -8,6 +8,7 @@ requests==2.32.5
 certifi==2025.11.12
 websockets==15.0.1
 packaging==25.0
+tenacity==8.4.1
 # Only required for Linux and macOS
 xvfbwrapper==0.2.16; platform_system != "Windows"
 # Only required for Windows

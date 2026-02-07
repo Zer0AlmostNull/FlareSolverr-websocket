@@ -14,6 +14,8 @@ class ChallengeResolutionResultT:
     turnstile_token: str = None
 
     def __init__(self, _dict):
+        if not isinstance(_dict, dict):
+            return
         self.__dict__.update(_dict)
 
 
@@ -23,6 +25,8 @@ class ChallengeResolutionT:
     result: ChallengeResolutionResultT = None
 
     def __init__(self, _dict):
+        if not isinstance(_dict, dict):
+            return
         self.__dict__.update(_dict)
         if self.result is not None:
             self.result = ChallengeResolutionResultT(self.result)
@@ -53,6 +57,8 @@ class V1RequestBase(object):
     tabs_till_verify : int = None
 
     def __init__(self, _dict):
+        if not isinstance(_dict, dict):
+            return
         self.__dict__.update(_dict)
 
 
@@ -73,6 +79,8 @@ class V1ResponseBase(object):
     __error_500__: bool = False
 
     def __init__(self, _dict):
+        if not isinstance(_dict, dict):
+            return
         self.__dict__.update(_dict)
         if self.solution is not None:
             self.solution = ChallengeResolutionResultT(self.solution)
@@ -84,6 +92,8 @@ class IndexResponse(object):
     userAgent: str = None
 
     def __init__(self, _dict):
+        if not isinstance(_dict, dict):
+            return
         self.__dict__.update(_dict)
 
 
@@ -91,4 +101,6 @@ class HealthResponse(object):
     status: str = None
 
     def __init__(self, _dict):
+        if not isinstance(_dict, dict):
+            return
         self.__dict__.update(_dict)

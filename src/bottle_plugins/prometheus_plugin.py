@@ -38,6 +38,14 @@ def prometheus_plugin(callback):
             # skip management and healthcheck endpoints
             return
 
+        # Skip metrics for websocket logger session
+        try:
+            req = V1RequestBase(request.json)
+            if req.session and req.session == "websocket_logger_session":
+                return
+        except:
+            pass
+
         domain = "unknown"
         if res.solution and res.solution.url:
             domain = parse_domain_url(res.solution.url)
@@ -61,6 +69,7 @@ def prometheus_plugin(callback):
 
     def parse_domain_url(url):
         parsed_url = urllib.parse.urlparse(url)
-        return parsed_url.hostname
+        hostname = parsed_url.hostname
+        return hostname if hostname else "unknown"
 
     return wrapper

@@ -2,6 +2,8 @@ import logging
 import platform
 import sys
 import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import timedelta
 from html import escape
 from urllib.parse import unquote, quote
@@ -55,6 +57,33 @@ TURNSTILE_SELECTORS = [
 
 SHORT_TIMEOUT = 1
 SESSIONS_STORAGE = SessionsStorage()
+
+@dataclass
+class WebsocketMessage:
+    timestamp: float
+    type: str  # "sent" or "received"
+    url: str
+    payload: str
+
+# WEBSOCKET_MESSAGES: deque[WebsocketMessage] = deque(maxlen=500)
+
+def _websocket_message_handler(session, event):
+    params = event['params']
+    frame_type = event['method'].split('.')[-1]  # "webSocketFrameReceived" or "webSocketFrameSent"
+
+    # Extract relevant information
+    url = params.get('url', session.driver.current_url) 
+    payload = params['response']['payloadData'] if 'response' in params and 'payloadData' in params['response'] else \
+              params.get('payloadData', '') # Fallback to empty string if not found
+
+    websocket_msg = WebsocketMessage(
+        timestamp=time.time(),
+        type=frame_type,
+        url=url,
+        payload=payload
+    )
+    session.websocket_messages.append(websocket_msg)
+    logging.info(f"Websocket message {frame_type}: {len(payload.encode('utf-8'))} bytes")
 
 
 def test_browser_installation():
@@ -230,6 +259,7 @@ def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
     timeout = int(req.maxTimeout) / 1000
     driver = None
     try:
+        session = None
         if req.session:
             session_id = req.session
             ttl = timedelta(minutes=req.session_ttl_minutes) if req.session_ttl_minutes else None
@@ -245,18 +275,45 @@ def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
         else:
             driver = utils.get_webdriver(req.proxy)
             logging.debug('New instance of webdriver has been created to perform the request')
+
+        # Enable CDP Network domain and listen for websocket frames
+        _session_websocket_message_handler_received = None
+        _session_websocket_message_handler_sent = None
+        try:
+            # We only want to listen for websocket messages if a session is provided
+            if session:
+                driver.execute_cdp_cmd("Network.enable", {})
+                _session_websocket_message_handler_received = lambda event: _websocket_message_handler(session, event)
+                _session_websocket_message_handler_sent = lambda event: _websocket_message_handler(session, event)
+                driver.add_cdp_listener("Network.webSocketFrameReceived", _session_websocket_message_handler_received)
+                driver.add_cdp_listener("Network.webSocketFrameSent", _session_websocket_message_handler_sent)
+                logging.debug("CDP websocket frame listeners added.")
+        except Exception as e:
+            logging.warning(f"Failed to enable CDP Network domain or add websocket listeners: {e}")
+
         return func_timeout(timeout, _evil_logic, (req, driver, method))
     except FunctionTimedOut:
         raise Exception(f'Error solving the challenge. Timeout after {timeout} seconds.')
     except Exception as e:
         raise Exception('Error solving the challenge. ' + str(e).replace('\n', '\\n'))
     finally:
+        # Disable CDP Network domain and remove listeners
+        try:
+            if session:
+                if _session_websocket_message_handler_received:
+                    driver.remove_cdp_listener("Network.webSocketFrameReceived", _session_websocket_message_handler_received)
+                if _session_websocket_message_handler_sent:
+                    driver.remove_cdp_listener("Network.webSocketFrameSent", _session_websocket_message_handler_sent)
+                driver.execute_cdp_cmd("Network.disable", {})
+                logging.debug("CDP websocket frame listeners removed and Network domain disabled.")
+        except Exception as e:
+            logging.warning(f"Failed to disable CDP Network domain or remove websocket listeners: {e}")
+
         if not req.session and driver is not None:
             if utils.PLATFORM_VERSION == "nt":
                 driver.close()
             driver.quit()
             logging.debug('A used instance of webdriver has been destroyed')
-
 
 def click_verify(driver: WebDriver, num_tabs: int = 1):
     try:
@@ -337,6 +394,7 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
     res = ChallengeResolutionT({})
     res.status = STATUS_OK
     res.message = ""
+    turnstile_token = None
 
     # optionally block resources like images/css/fonts using CDP
     disable_media = utils.get_config_disable_media()
@@ -366,8 +424,6 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
 
     # navigate to the page
     logging.debug(f"Navigating to... {req.url}")
-    turnstile_token = None
-
     if method == "POST":
         _post_request(req, driver)
     else:
@@ -517,3 +573,4 @@ def _post_request(req: V1RequestBase, driver: WebDriver):
         </body>
         </html>"""
     driver.get("data:text/html;charset=utf-8,{html_content}".format(html_content=html_content))
+
