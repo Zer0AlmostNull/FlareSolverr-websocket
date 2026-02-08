@@ -13,3 +13,5 @@ tenacity==8.4.1
 xvfbwrapper==0.2.16; platform_system != "Windows"
 # Only required for Windows
 pefile==2024.8.26; platform_system == "Windows"
+# For periodic session reload
+aiocron>=1.1

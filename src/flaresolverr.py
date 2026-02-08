@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ from collections import deque
 from dataclasses import dataclass
 from tenacity import retry, wait_exponential, stop_after_delay, retry_if_exception_type
 
+import aiocron
 import certifi
 from bottle import run, response, Bottle, request, ServerAdapter
 
@@ -30,6 +32,8 @@ _websocket_logger_session_id = None
 WEBSOCKET_MESSAGES: deque[flaresolverr_service.WebsocketMessage] = deque(maxlen=500)
 SESSION_HEALTH_CHECK_INTERVAL = int(os.environ.get("SESSION_HEALTH_CHECK_INTERVAL", 60)) # seconds
 WEBSOCKET_LOGGER_SESSION_ID = "websocket_logger_session"
+SESSION_RELOAD_INTERVAL = int(os.environ.get("SESSION_RELOAD_INTERVAL", 1800)) # 30 minutes default (in seconds)
+_session_reload_cron_job = None
 
 
 class JSONErrorBottle(Bottle):
@@ -136,18 +140,34 @@ def _quit_websocket_logger_driver():
     if _websocket_logger_driver:
         logging.info("Quitting existing WebSocket Logger WebDriver session...")
         try:
+            logging.debug("Disabling Network domain...")
             _websocket_logger_driver.execute_cdp_cmd("Network.disable", {})
+            logging.debug("Network domain disabled.")
+        except Exception as e:
+            logging.warning(f"Error while disabling Network domain: {e}")
+        
+        try:
+            logging.debug("Removing CDP websocket frame listeners...")
             _websocket_logger_driver.remove_cdp_listener("Network.webSocketFrameReceived", _websocket_message_handler)
             _websocket_logger_driver.remove_cdp_listener("Network.webSocketFrameSent", _websocket_message_handler)
-            logging.debug("CDP websocket frame listeners removed and Network domain disabled for WebSocket Logger.")
-            _websocket_logger_driver.quit()
+            logging.debug("CDP websocket frame listeners removed.")
         except Exception as e:
-            logging.warning(f"Error while quitting WebSocket Logger driver: {e}")
-        _websocket_logger_driver = None
-    if _websocket_logger_session_id:
+            logging.warning(f"Error while removing CDP listeners: {e}")
+        
         try:
-            if _websocket_logger_session_id:
-                flaresolverr_service.SESSIONS_STORAGE.destroy(_websocket_logger_session_id)
+            logging.debug("Closing WebDriver...")
+            _websocket_logger_driver.quit()
+            logging.info("WebDriver quit successfully.")
+        except Exception as e:
+            logging.warning(f"Error while quitting WebDriver: {e}")
+        
+        _websocket_logger_driver = None
+    
+    if _websocket_logger_session_id:
+        logging.info(f"Destroying session '{_websocket_logger_session_id}' from storage...")
+        try:
+            flaresolverr_service.SESSIONS_STORAGE.destroy(_websocket_logger_session_id)
+            logging.info(f"Session '{_websocket_logger_session_id}' destroyed successfully.")
         except Exception as e:
             logging.warning(f"Error while destroying WebSocket Logger session '{_websocket_logger_session_id}': {e}")
         _websocket_logger_session_id = None
@@ -202,6 +222,26 @@ def initialize_websocket_logger_session():
     except Exception as e:
         logging.error(f"Failed to initialize persistent session or navigate to URL: {e}", exc_info=True)
         raise
+
+async def _async_reload_session():
+    """Async function to reload the websocket logger session periodically"""
+    logging.info("=" * 80)
+    logging.info("Starting WebSocket Logger session reload to prevent stalls...")
+    logging.info("=" * 80)
+    try:
+        logging.info("Closing old session...")
+        _quit_websocket_logger_driver()
+        logging.info("Old session closed. Waiting 2 seconds before reinitializing...")
+        await asyncio.sleep(2)  # Give system time to release resources
+        
+        logging.info("Reinitializing WebSocket Logger session...")
+        initialize_websocket_logger_session()
+        logging.info("=" * 80)
+        logging.info("WebSocket Logger session reloaded successfully.")
+        logging.info("=" * 80)
+    except Exception as e:
+        logging.error(f"Failed to reload WebSocket Logger session: {e}", exc_info=True)
+        logging.error("=" * 80)
 
 def websocket_logger_health_checker_thread():
     global _websocket_logger_driver
@@ -333,6 +373,14 @@ if __name__ == "__main__":
         health_thread = threading.Thread(target=websocket_logger_health_checker_thread, daemon=True)
         health_thread.start()
         logging.info("WebSocket Logger health checker thread started.")
+        
+        # Start periodic session reload using asynciocron
+        try:
+            reload_minutes = SESSION_RELOAD_INTERVAL // 60
+            _session_reload_cron_job = aiocron.crontab(f'*/{reload_minutes} * * * *', func=_async_reload_session, start=True)
+            logging.info(f"WebSocket Logger session reload scheduled every {reload_minutes} minutes (interval: {SESSION_RELOAD_INTERVAL}s).")
+        except Exception as e:
+            logging.warning(f"Failed to schedule periodic session reload with asynciocron: {e}", exc_info=True)
     else:
         logging.info("TARGET_URL is not set. Persistent WebSocket Logger session will not be started.")
 
