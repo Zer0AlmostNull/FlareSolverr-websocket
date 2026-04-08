@@ -32,6 +32,10 @@ def get_config_disable_media() -> bool:
     return os.environ.get('DISABLE_MEDIA', 'false').lower() == 'true'
 
 
+def get_config_websocket_max_messages() -> int:
+    return int(os.environ.get('WEBSOCKET_MAX_MESSAGES', '100'))
+
+
 def get_flaresolverr_version() -> str:
     global FLARESOLVERR_VERSION
     if FLARESOLVERR_VERSION is not None:
@@ -143,6 +147,50 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     options.add_argument('--disable-dev-shm-usage')
     # this option removes the zygote sandbox (it seems that the resolution is a bit faster)
     options.add_argument('--no-zygote')
+    # memory optimization
+    options.add_argument('--disable-gpu')
+    options.add_argument('--disable-software-rasterizer')
+    options.add_argument('--disk-cache-size=1')
+    options.add_argument('--media-cache-size=1')
+    options.add_argument('--renderer-process-limit=1')
+    options.add_argument('--js-flags=--max-old-space-size=512')
+    options.add_argument('--memory-pressure-off')
+    options.add_argument('--disable-features=IsolateOrigins,site-per-process,AudioServiceOutOfProcess')
+    options.add_argument('--disable-site-isolation-trials')
+    options.add_argument('--disable-v8-idle-tasks')
+    options.add_argument('--process-per-site')
+    options.add_argument('--disable-extensions')
+    options.add_argument('--disable-component-extensions-with-background-pages')
+    options.add_argument('--disable-default-apps')
+    options.add_argument('--mute-audio')
+    options.add_argument('--no-default-browser-check')
+    options.add_argument('--autoplay-policy=no-user-gesture-required')
+    options.add_argument('--disable-back-forward-cache')
+    options.add_argument('--disable-background-networking')
+    options.add_argument('--disable-background-timer-throttling')
+    options.add_argument('--disable-backgrounding-occluded-windows')
+    options.add_argument('--disable-breakpad')
+    options.add_argument('--disable-client-side-phishing-detection')
+    options.add_argument('--disable-component-update')
+    options.add_argument('--disable-datasaver-prompt')
+    options.add_argument('--disable-domain-reliability')
+    options.add_argument('--disable-hang-monitor')
+    options.add_argument('--disable-ipc-flooding-protection')
+    options.add_argument('--disable-notifications')
+    options.add_argument('--disable-offer-store-unmasked-wallet-cards')
+    options.add_argument('--disable-popup-blocking')
+    options.add_argument('--disable-print-preview')
+    options.add_argument('--disable-prompt-on-repost')
+    options.add_argument('--disable-renderer-backgrounding')
+    options.add_argument('--disable-speech-api')
+    options.add_argument('--disable-sync')
+    options.add_argument('--hide-scrollbars')
+    options.add_argument('--ignore-gpu-blacklist')
+    options.add_argument('--metrics-recording-only')
+    options.add_argument('--no-first-run')
+    options.add_argument('--no-pings')
+    options.add_argument('--password-store=basic')
+    options.add_argument('--use-mock-keychain')
     # attempt to fix Docker ARM32 build
     IS_ARMARCH = platform.machine().startswith(('arm', 'aarch'))
     if IS_ARMARCH:

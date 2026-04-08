@@ -9,13 +9,19 @@ from selenium.webdriver.chrome.webdriver import WebDriver
 
 import utils
 
+SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=30)
+SESSION_MAX_LIFETIME = timedelta(minutes=30)
+
 
 @dataclass
 class Session:
     session_id: str
     driver: WebDriver
     created_at: datetime
-    websocket_messages: deque = field(default_factory=lambda: deque(maxlen=500))
+    last_request_timestamp: datetime = field(default_factory=datetime.now)
+    websocket_messages: deque = field(default_factory=lambda: deque(maxlen=utils.get_config_websocket_max_messages()))
+    last_known_url: str = ""
+    url_cache_time: float = 0
 
     def lifetime(self) -> timedelta:
         return datetime.now() - self.created_at
@@ -79,8 +85,30 @@ class SessionsStorage:
         if ttl is not None and not fresh and session.lifetime() > ttl:
             logging.debug(f'session\'s lifetime has expired, so the session is recreated (session_id={session_id})')
             session, fresh = self.create(session_id, force_new=True)
+        
+        session.last_request_timestamp = datetime.now()
 
         return session, fresh
 
     def session_ids(self) -> list[str]:
         return list(self.sessions.keys())
+
+    def cleanup_stale_sessions(self):
+        logging.debug("Cleaning up stale sessions...")
+        session_ids_to_destroy = []
+        now = datetime.now()
+        for session_id, session in self.sessions.items():
+            if (now - session.last_request_timestamp) > SESSION_INACTIVITY_TIMEOUT:
+                logging.info(
+                    f"Session {session_id} inactive for too long. Last activity: {session.last_request_timestamp}. Destroying."
+                )
+                session_ids_to_destroy.append(session_id)
+            elif session.lifetime() > SESSION_MAX_LIFETIME:
+                logging.info(
+                    f"Session {session_id} exceeded maximum lifetime. Created at: {session.created_at}. Destroying."
+                )
+                session_ids_to_destroy.append(session_id)
+        
+        for session_id in session_ids_to_destroy:
+            self.destroy(session_id)
+        logging.debug(f"Cleaned up {len(session_ids_to_destroy)} stale sessions.")

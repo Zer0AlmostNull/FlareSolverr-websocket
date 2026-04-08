@@ -72,7 +72,16 @@ def _websocket_message_handler(session, event):
     frame_type = event['method'].split('.')[-1]  # "webSocketFrameReceived" or "webSocketFrameSent"
 
     # Extract relevant information
-    url = params.get('url', session.driver.current_url) 
+    now = time.time()
+    # Cache the URL for 5 seconds to avoid excessive current_url calls
+    if now - session.url_cache_time > 5:
+        try:
+            session.last_known_url = session.driver.current_url
+            session.url_cache_time = now
+        except Exception:
+            pass
+
+    url = params.get('url', session.last_known_url) 
     payload = params['response']['payloadData'] if 'response' in params and 'payloadData' in params['response'] else \
               params.get('payloadData', '') # Fallback to empty string if not found
 

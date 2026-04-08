@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import os
@@ -9,7 +8,6 @@ from collections import deque
 from dataclasses import dataclass
 from tenacity import retry, wait_exponential, stop_after_delay, retry_if_exception_type
 
-import aiocron
 import certifi
 from bottle import run, response, Bottle, request, ServerAdapter
 
@@ -29,11 +27,10 @@ env_proxy_password = os.environ.get('PROXY_PASSWORD', None)
 TARGET_URL = os.environ.get("TARGET_URL")
 _websocket_logger_driver = None
 _websocket_logger_session_id = None
-WEBSOCKET_MESSAGES: deque[flaresolverr_service.WebsocketMessage] = deque(maxlen=500)
+WEBSOCKET_MESSAGES: deque[flaresolverr_service.WebsocketMessage] = deque(maxlen=utils.get_config_websocket_max_messages())
 SESSION_HEALTH_CHECK_INTERVAL = int(os.environ.get("SESSION_HEALTH_CHECK_INTERVAL", 60)) # seconds
 WEBSOCKET_LOGGER_SESSION_ID = "websocket_logger_session"
 SESSION_RELOAD_INTERVAL = int(os.environ.get("SESSION_RELOAD_INTERVAL", 1800)) # 30 minutes default (in seconds)
-_session_reload_cron_job = None
 
 
 class JSONErrorBottle(Bottle):
@@ -111,11 +108,24 @@ def get_websocket_messages():
     response.content_type = 'application/json'
     return json.dumps(messages)
 
+_last_known_url = ""
+_url_cache_time = 0
+
 def _websocket_message_handler(event):
+    global _last_known_url, _url_cache_time
     params = event['params']
     frame_type = event['method'].split('.')[-1]  # "webSocketFrameReceived" or "webSocketFrameSent"
 
-    url = params.get('url', _websocket_logger_driver.current_url if _websocket_logger_driver else "")
+    now = time.time()
+    # Cache the URL for 5 seconds to avoid excessive current_url calls
+    if now - _url_cache_time > 5:
+        try:
+            _last_known_url = _websocket_logger_driver.current_url if _websocket_logger_driver else TARGET_URL
+            _url_cache_time = now
+        except Exception:
+            _last_known_url = _last_known_url or TARGET_URL
+
+    url = params.get('url', _last_known_url)
     payload = params['response']['payloadData'] if 'response' in params and 'payloadData' in params['response'] else \
               params.get('payloadData', '')
 
@@ -223,48 +233,65 @@ def initialize_websocket_logger_session():
         logging.error(f"Failed to initialize persistent session or navigate to URL: {e}", exc_info=True)
         raise
 
-async def _async_reload_session():
-    """Async function to reload the websocket logger session periodically"""
-    logging.info("=" * 80)
-    logging.info("Starting WebSocket Logger session reload to prevent stalls...")
-    logging.info("=" * 80)
-    try:
-        logging.info("Closing old session...")
-        _quit_websocket_logger_driver()
-        logging.info("Old session closed. Waiting 2 seconds before reinitializing...")
-        await asyncio.sleep(2)  # Give system time to release resources
-        
-        logging.info("Reinitializing WebSocket Logger session...")
-        initialize_websocket_logger_session()
-        logging.info("=" * 80)
-        logging.info("WebSocket Logger session reloaded successfully.")
-        logging.info("=" * 80)
-    except Exception as e:
-        logging.error(f"Failed to reload WebSocket Logger session: {e}", exc_info=True)
-        logging.error("=" * 80)
-
-def websocket_logger_health_checker_thread():
+def background_tasks_thread():
     global _websocket_logger_driver
+    last_cleanup = 0
+    last_reload = time.time()
+    CLEANUP_INTERVAL = 600 # 10 minutes
+
     while True:
-        time.sleep(SESSION_HEALTH_CHECK_INTERVAL)
-        if _websocket_logger_driver:
+        now = time.time()
+        
+        # Cleanup stale sessions in the general storage
+        if now - last_cleanup >= CLEANUP_INTERVAL:
             try:
-                _ = _websocket_logger_driver.current_url
-                logging.debug("WebSocket Logger WebDriver session is healthy.")
+                logging.debug("Triggering periodic stale sessions cleanup...")
+                flaresolverr_service.SESSIONS_STORAGE.cleanup_stale_sessions()
+                last_cleanup = now
             except Exception as e:
-                logging.error(f"WebSocket Logger WebDriver session became unhealthy: {e}. Attempting to re-initialize session.", exc_info=True)
+                logging.error(f"Error during stale sessions cleanup: {e}")
+
+        # WebSocket Logger management (if TARGET_URL is set)
+        if TARGET_URL:
+            # Check for scheduled reload to prevent memory leaks and stalls
+            if now - last_reload >= SESSION_RELOAD_INTERVAL:
+                logging.info("=" * 80)
+                logging.info("WebSocket Logger session reload interval reached. Reloading to prevent stalls and memory leaks...")
+                logging.info("=" * 80)
+                try:
+                    _quit_websocket_logger_driver()
+                    time.sleep(2) # Give system time to release resources
+                    initialize_websocket_logger_session()
+                    last_reload = time.time()
+                    logging.info("=" * 80)
+                    logging.info("WebSocket Logger session reloaded successfully.")
+                    logging.info("=" * 80)
+                except Exception as e:
+                    logging.error(f"Failed to reload WebSocket Logger session: {e}", exc_info=True)
+            
+            # Health check for the persistent session
+            if _websocket_logger_driver:
+                try:
+                    _ = _websocket_logger_driver.current_url
+                    logging.debug("WebSocket Logger WebDriver session is healthy.")
+                except Exception as e:
+                    logging.error(f"WebSocket Logger WebDriver session became unhealthy: {e}. Attempting to re-initialize session.", exc_info=True)
+                    try:
+                        initialize_websocket_logger_session()
+                        last_reload = time.time() # Reset reload timer if we just re-initialized
+                        logging.info("WebSocket Logger WebDriver session re-initialized successfully.")
+                    except Exception as re_e:
+                        logging.critical(f"Failed to re-initialize WebSocket Logger WebDriver session after multiple retries: {re_e}", exc_info=True)
+            else:
+                logging.debug("WebSocket Logger WebDriver not initialized, waiting for it...")
                 try:
                     initialize_websocket_logger_session()
-                    logging.info("WebSocket Logger WebDriver session re-initialized successfully.")
+                    last_reload = time.time()
+                    logging.info("WebSocket Logger WebDriver session initialized.")
                 except Exception as re_e:
-                    logging.critical(f"Failed to re-initialize WebSocket Logger WebDriver session after multiple retries: {re_e}", exc_info=True)
-        else:
-            logging.debug("WebSocket Logger WebDriver not initialized, waiting for it...")
-            try:
-                initialize_websocket_logger_session()
-                logging.info("WebSocket Logger WebDriver session initialized by health checker.")
-            except Exception as re_e:
-                logging.critical(f"Failed to initialize WebSocket Logger WebDriver session by health checker: {re_e}", exc_info=True)
+                    logging.critical(f"Failed to initialize WebSocket Logger WebDriver session: {re_e}", exc_info=True)
+                    
+        time.sleep(SESSION_HEALTH_CHECK_INTERVAL)
 
 @app.get('/websocket_logger/messages')
 def get_websocket_logger_messages():
@@ -361,26 +388,20 @@ if __name__ == "__main__":
             from waitress import serve
             serve(handler, host=self.host, port=self.port, asyncore_use_poll=True)
     
-    # Initialize and start persistent websocket logger session if TARGET_URL is provided
-    if TARGET_URL:
-        logging.info("TARGET_URL is set. Initializing persistent WebSocket Logger session...")
-        try:
-            initialize_websocket_logger_session()
-        except Exception as e:
-            logging.critical(f"Persistent WebSocket Logger session failed to initialize after multiple retries: {e}")
-            sys.exit(1)
+    # Start background tasks (session cleanup, reload, and health checker)
+    background_thread = threading.Thread(target=background_tasks_thread, daemon=True)
+    background_thread.start()
+    logging.info("Background tasks thread started.")
 
-        health_thread = threading.Thread(target=websocket_logger_health_checker_thread, daemon=True)
-        health_thread.start()
-        logging.info("WebSocket Logger health checker thread started.")
-        
-        # Start periodic session reload using asynciocron
+    # Initialize persistent websocket logger session if TARGET_URL is provided
+    if TARGET_URL:
+        logging.info("TARGET_URL is set. Ensuring initial WebSocket Logger session...")
         try:
-            reload_minutes = SESSION_RELOAD_INTERVAL // 60
-            _session_reload_cron_job = aiocron.crontab(f'*/{reload_minutes} * * * *', func=_async_reload_session, start=True)
-            logging.info(f"WebSocket Logger session reload scheduled every {reload_minutes} minutes (interval: {SESSION_RELOAD_INTERVAL}s).")
+            if not _websocket_logger_driver:
+                initialize_websocket_logger_session()
         except Exception as e:
-            logging.warning(f"Failed to schedule periodic session reload with asynciocron: {e}", exc_info=True)
+            logging.critical(f"Initial Persistent WebSocket Logger session failed: {e}")
+            sys.exit(1)
     else:
         logging.info("TARGET_URL is not set. Persistent WebSocket Logger session will not be started.")
 

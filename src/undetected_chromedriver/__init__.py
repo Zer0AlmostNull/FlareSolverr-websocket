@@ -680,6 +680,18 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
             return self.reactor.handlers
         return False
 
+    def remove_cdp_listener(self, event_name, callback=None):
+        if (
+            self.reactor
+            and self.reactor is not None
+            and isinstance(self.reactor, Reactor)
+        ):
+            with self.reactor.lock:
+                if event_name.lower() in self.reactor.handlers:
+                    del self.reactor.handlers[event_name.lower()]
+            return True
+        return False
+
     def clear_cdp_listeners(self):
         if self.reactor and isinstance(self.reactor, Reactor):
             self.reactor.handlers.clear()
