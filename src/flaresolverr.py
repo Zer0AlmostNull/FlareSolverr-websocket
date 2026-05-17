@@ -88,7 +88,7 @@ def get_websocket_messages():
     Returns all collected websocket messages for a given session and clears the queue.
     """
     session_id = request.query.get('session')
-    logging.info("Received request for /websocket_messages")
+    logging.debug("Received request for /websocket_messages")
 
     # If a session id is provided, return messages from that session's queue.
     # If no session id is provided, return messages from the global queue and clear it.
@@ -138,7 +138,7 @@ def _websocket_message_handler(event):
     WEBSOCKET_MESSAGES.append(websocket_msg)
     
     payload_bytes = len(payload.encode('utf-8'))
-    logging.info(f"Websocket message from {url} {frame_type}: {payload_bytes} bytes")
+    logging.debug(f"Websocket message from {url} {frame_type}: {payload_bytes} bytes")
     
     # Track bytes received from websocket
     if frame_type == "webSocketFrameReceived":
