@@ -3,15 +3,17 @@ version: "2.1"
 services:
   flaresolverr:
     # DockerHub mirror flaresolverr/flaresolverr:latest
-    build: .
+    image: ghcr.io/flaresolverr/flaresolverr:latest
     container_name: flaresolverr
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - LOG_FILE=${LOG_FILE:-none}
       - LOG_HTML=${LOG_HTML:-false}
       - CAPTCHA_SOLVER=${CAPTCHA_SOLVER:-none}
+      - TARGET_URL=${TARGET_URL:-}
+      - WEBSOCKET_MAX_MESSAGES=${WEBSOCKET_MAX_MESSAGES:-100}
+      - SESSION_RELOAD_INTERVAL=${SESSION_RELOAD_INTERVAL:-1800}
       - TZ=Europe/London
-      - TARGET_URL=https://mevx.io/?chain=solana
     ports:
       - "${PORT:-8191}:8191"
     volumes:

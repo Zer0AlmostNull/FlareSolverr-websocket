@@ -58,7 +58,7 @@ If you prefer the `docker cli` execute the following command:
 ```bash
 docker run -d \
   --name=flaresolverr \
-  -p 8191:8191 \
+  -p 127.0.0.1:8191:8191 \
   -e LOG_LEVEL=info \
   --restart unless-stopped \
   ghcr.io/flaresolverr/flaresolverr:latest
@@ -67,12 +67,14 @@ docker run -d \
 **Command Prompt or Powershell**
 
 ```cmd
-docker run -d --name=flaresolverr -p 8191:8191 -e LOG_LEVEL=info --restart unless-stopped ghcr.io/flaresolverr/flaresolverr:latest
+docker run -d --name=flaresolverr -p 127.0.0.1:8191:8191 -e LOG_LEVEL=info --restart unless-stopped ghcr.io/flaresolverr/flaresolverr:latest
 ```
 
 If your host OS is Debian, make sure `libseccomp2` version is 2.5.x. You can check the version with `sudo apt-cache policy libseccomp2`
 and update the package with `sudo apt install libseccomp2=2.5.1-1~bpo10+1` or `sudo apt install libseccomp2=2.5.1-1+deb11u1`.
 Remember to restart the Docker daemon and the container after the update.
+
+DO NOT expose FlareSolverr to the internet, as it can be abused.
 
 ### Precompiled binaries
 
@@ -89,7 +91,7 @@ This is the recommended way for Windows users.
 > **Warning**
 > Installing from source code only works for x64 architecture. For other architectures see Docker images.
 
-- Install [Python 3.13](https://www.python.org/downloads/).
+- Install [Python 3.11](https://www.python.org/downloads/).
 - Install [Chrome](https://www.google.com/intl/en_us/chrome/) (all OS) or [Chromium](https://www.chromium.org/getting-involved/download-chromium/) (just Linux, it doesn't work in Windows) web browser.
 - (Only in Linux) Install [Xvfb](https://en.wikipedia.org/wiki/Xvfb) package.
 - (Only in macOS) Install [XQuartz](https://www.xquartz.org/) package.
@@ -101,8 +103,8 @@ This is the recommended way for Windows users.
 
 - Run `pkg install chromium python313 py313-pip xorg-vfbserver` command to install the required dependencies.
 - Clone this repository and open a shell in that path.
-- Run `python3.13 -m pip install -r requirements.txt` command to install FlareSolverr dependencies.
-- Run `python3.13 src/flaresolverr.py` command to start FlareSolverr.
+- Run `python3.11 -m pip install -r requirements.txt` command to install FlareSolverr dependencies.
+- Run `python3.11 src/flaresolverr.py` command to start FlareSolverr.
 
 ### Systemd service
 
@@ -295,6 +297,13 @@ This works like `request.get`, with the addition of the postData parameter. Note
 | HOST               | 0.0.0.0                | Listening interface. You don't need to change this if you are running on Docker.                                                         |
 | PROMETHEUS_ENABLED | false                  | Enable Prometheus exporter. See the Prometheus section below.                                                                            |
 | PROMETHEUS_PORT    | 8192                   | Listening port for Prometheus exporter. See the Prometheus section below.                                                                |
+| WEBSOCKET_MAX_MESSAGES | 100                | Maximum websocket frames retained per queue.                                                                                              |
+| TARGET_URL          | none                   | Optional URL for the persistent websocket logger.                                                                                        |
+| SESSION_RELOAD_INTERVAL | 1800              | Persistent websocket logger refresh interval, in seconds.                                                                               |
+
+When `TARGET_URL` is configured, websocket frames observed by the persistent logger are available at `GET /websocket_logger/messages`.
+Frames captured for a normal FlareSolverr session are available at `GET /websocket_messages?session=<session-id>`;
+without `session`, the endpoint returns and clears the global queue. Both endpoints return JSON arrays and clear the queue after a successful read.
 
 Environment variables are set differently depending on the operating system. Some examples:
 
