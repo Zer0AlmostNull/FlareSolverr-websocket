@@ -1,12 +1,14 @@
 import logging
 import platform
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from html import escape
 from urllib.parse import unquote, quote
+from uuid import uuid4
 
 from func_timeout import FunctionTimedOut, func_timeout
 from selenium.common import TimeoutException
@@ -58,6 +60,10 @@ TURNSTILE_SELECTORS = [
 SHORT_TIMEOUT = 1
 SESSIONS_STORAGE = SessionsStorage()
 
+class MaxListenersReachedError(Exception):
+    pass
+
+
 @dataclass
 class WebsocketMessage:
     timestamp: float
@@ -65,9 +71,23 @@ class WebsocketMessage:
     url: str
     payload: str
 
+
+@dataclass
+class WebSocketListener:
+    listener_id: str
+    session_id: str
+    url: str
+    created_at: datetime
+    last_heartbeat: datetime
+    ttl_minutes: int = 30
+    max_messages: int = 500
+    status: str = "starting"  # starting | running | unhealthy
+    error_message: str = ""
+    reconnect_attempts: int = 0
+
 # WEBSOCKET_MESSAGES: deque[WebsocketMessage] = deque(maxlen=500)
 
-def _websocket_message_handler(session, event):
+def _websocket_message_handler(session, event, log_level=logging.INFO):
     params = event['params']
     frame_type = event['method'].split('.')[-1]  # "webSocketFrameReceived" or "webSocketFrameSent"
 
@@ -92,7 +112,132 @@ def _websocket_message_handler(session, event):
         payload=payload
     )
     session.websocket_messages.append(websocket_msg)
-    logging.info(f"Websocket message {frame_type}: {len(payload.encode('utf-8'))} bytes")
+    logging.log(log_level, f"Websocket message {frame_type}: {len(payload.encode('utf-8'))} bytes")
+
+
+def _register_listener_cdp(session):
+    driver = session.driver
+    driver.execute_cdp_cmd("Network.enable", {})
+
+    def _handler(event, _session=session):
+        _websocket_message_handler(_session, event, log_level=logging.DEBUG)
+
+    driver.add_cdp_listener("Network.webSocketFrameReceived", _handler)
+    driver.add_cdp_listener("Network.webSocketFrameSent", _handler)
+    return _handler
+
+
+class WebSocketListenerManager:
+    def __init__(self, max_listeners: int = 5):
+        self.listeners: dict[str, WebSocketListener] = {}
+        self.max_listeners = max_listeners
+        self._lock = threading.Lock()
+
+    def _get_session(self, listener: WebSocketListener):
+        return SESSIONS_STORAGE.sessions.get(listener.session_id)
+
+    def create_listener(self, url: str, ttl_minutes: int = None,
+                        max_messages: int = None) -> WebSocketListener:
+        if not url:
+            raise ValueError("Field 'url' is mandatory.")
+        with self._lock:
+            if len(self.listeners) >= self.max_listeners:
+                raise MaxListenersReachedError(
+                    f"Max listeners reached ({self.max_listeners})")
+            ttl_minutes = ttl_minutes or utils.get_config_ws_listener_default_ttl()
+            max_messages = max_messages or utils.get_config_ws_listener_default_max_msgs()
+            listener_id = str(uuid4())
+            session, _ = SESSIONS_STORAGE.create(session_id=f"ws_listener_{listener_id}")
+            session.websocket_messages = deque(maxlen=max_messages)
+            _register_listener_cdp(session)
+            now = datetime.now()
+            listener = WebSocketListener(
+                listener_id=listener_id,
+                session_id=session.session_id,
+                url=url,
+                created_at=now,
+                last_heartbeat=now,
+                ttl_minutes=ttl_minutes,
+                max_messages=max_messages,
+                status="starting",
+            )
+            self.listeners[listener_id] = listener
+        try:
+            session.driver.get(url)
+        except Exception:
+            self.listeners.pop(listener_id, None)
+            try:
+                SESSIONS_STORAGE.destroy(listener.session_id)
+            except Exception:
+                pass
+            raise
+        listener.status = "running"
+        return listener
+
+    def get_listener(self, listener_id: str) -> WebSocketListener | None:
+        with self._lock:
+            listener = self.listeners.get(listener_id)
+            if listener is not None:
+                listener.last_heartbeat = datetime.now()
+            return listener
+
+    def list_listeners(self) -> list[WebSocketListener]:
+        return list(self.listeners.values())
+
+    def destroy_listener(self, listener_id: str) -> bool:
+        with self._lock:
+            listener = self.listeners.pop(listener_id, None)
+            if listener is None:
+                return False
+        try:
+            SESSIONS_STORAGE.destroy(listener.session_id)
+        except Exception as e:
+            logging.warning(f"Error destroying session for listener {listener_id}: {e}")
+        return True
+
+    def cleanup_stale(self):
+        now = datetime.now()
+        for listener_id, listener in list(self.listeners.items()):
+            if (now - listener.last_heartbeat) > timedelta(minutes=listener.ttl_minutes):
+                logging.info(f"Listener {listener_id} inactive for "
+                             f"{listener.ttl_minutes} min. Destroying.")
+                self.destroy_listener(listener_id)
+                continue
+            session = self._get_session(listener)
+            if session is None:
+                logging.warning(f"Listener {listener_id}: session missing. Destroying.")
+                self.destroy_listener(listener_id)
+                continue
+            try:
+                _ = session.driver.current_url
+                if listener.status != "running":
+                    listener.status = "running"
+                    listener.error_message = ""
+            except Exception as e:
+                listener.status = "unhealthy"
+                listener.error_message = str(e)
+                if listener.reconnect_attempts >= 3:
+                    logging.warning(f"Listener {listener_id}: max reconnect attempts "
+                                    f"({listener.reconnect_attempts}) reached, destroying.")
+                    self.destroy_listener(listener_id)
+                else:
+                    self._reconnect_listener(listener)
+
+    def _reconnect_listener(self, listener: WebSocketListener):
+        listener.reconnect_attempts += 1
+        try:
+            SESSIONS_STORAGE.destroy(listener.session_id)
+            session, _ = SESSIONS_STORAGE.create(session_id=listener.session_id)
+            session.websocket_messages = deque(maxlen=listener.max_messages)
+            _register_listener_cdp(session)
+            session.driver.get(listener.url)
+            if listener.listener_id in self.listeners:
+                listener.status = "running"
+                listener.error_message = ""
+            else:
+                SESSIONS_STORAGE.destroy(listener.session_id)
+        except Exception as e:
+            listener.error_message = f"Reconnect failed: {e}"
 
 
 def test_browser_installation():

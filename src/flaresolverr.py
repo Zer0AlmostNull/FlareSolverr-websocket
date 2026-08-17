@@ -4,9 +4,6 @@ import os
 import sys
 import threading
 import time
-from collections import deque
-from dataclasses import dataclass
-from tenacity import retry, wait_exponential, stop_after_delay, retry_if_exception_type
 
 import certifi
 from bottle import run, response, Bottle, request, ServerAdapter
@@ -14,7 +11,7 @@ from bottle import run, response, Bottle, request, ServerAdapter
 from bottle_plugins.error_plugin import error_plugin
 from bottle_plugins.logger_plugin import logger_plugin
 from bottle_plugins import prometheus_plugin
-from metrics import WEBSOCKET_LOGGER_SESSION_TOTAL, WEBSOCKET_BYTES_RECEIVED_TOTAL
+from metrics import WEBSOCKET_LOGGER_SESSION_TOTAL
 from dtos import V1RequestBase, HealthResponse, STATUS_OK # Added HealthResponse, STATUS_OK
 import flaresolverr_service
 import utils
@@ -23,14 +20,10 @@ env_proxy_url = os.environ.get('PROXY_URL', None)
 env_proxy_username = os.environ.get('PROXY_USERNAME', None)
 env_proxy_password = os.environ.get('PROXY_PASSWORD', None)
 
-# Global WebDriver instance for the single persistent websocket logger session
-TARGET_URL = os.environ.get("TARGET_URL")
-_websocket_logger_driver = None
-_websocket_logger_session_id = None
-WEBSOCKET_MESSAGES: deque[flaresolverr_service.WebsocketMessage] = deque(maxlen=utils.get_config_websocket_max_messages())
 SESSION_HEALTH_CHECK_INTERVAL = int(os.environ.get("SESSION_HEALTH_CHECK_INTERVAL", 60)) # seconds
-WEBSOCKET_LOGGER_SESSION_ID = "websocket_logger_session"
-SESSION_RELOAD_INTERVAL = int(os.environ.get("SESSION_RELOAD_INTERVAL", 1800)) # 30 minutes default (in seconds)
+
+ws_listener_manager = flaresolverr_service.WebSocketListenerManager(
+    max_listeners=utils.get_config_max_ws_listeners())
 
 
 class JSONErrorBottle(Bottle):
@@ -82,17 +75,127 @@ def controller_v1():
         response.status = 500
     return utils.object_to_dict(res)
 
+def _listener_message_count(listener):
+    session = flaresolverr_service.SESSIONS_STORAGE.sessions.get(listener.session_id)
+    return len(session.websocket_messages) if session else 0
+
+
+@app.post('/v1/ws/listeners')
+def ws_listeners_create():
+    data = request.json or {}
+    try:
+        listener = ws_listener_manager.create_listener(
+            url=data.get('url'),
+            ttl_minutes=data.get('ttl_minutes'),
+            max_messages=data.get('max_messages'),
+        )
+    except flaresolverr_service.MaxListenersReachedError as e:
+        response.status = 429
+        response.content_type = 'application/json'
+        return json.dumps({"error": str(e)})
+    except ValueError as e:
+        response.status = 400
+        response.content_type = 'application/json'
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logging.error(f"Failed to create ws listener for {data.get('url')}: {e}")
+        response.status = 500
+        response.content_type = 'application/json'
+        return json.dumps({"error": str(e)})
+    WEBSOCKET_LOGGER_SESSION_TOTAL.labels(url=listener.url).inc()
+    response.content_type = 'application/json'
+    return json.dumps({
+        "listener_id": listener.listener_id,
+        "status": listener.status,
+        "url": listener.url,
+    })
+
+
+@app.get('/v1/ws/listeners')
+def ws_listeners_list():
+    listeners = ws_listener_manager.list_listeners()
+    response.content_type = 'application/json'
+    return json.dumps([{
+        "listener_id": l.listener_id,
+        "url": l.url,
+        "status": l.status,
+        "created_at": l.created_at.isoformat(),
+        "message_count": _listener_message_count(l),
+    } for l in listeners])
+
+
+@app.get('/v1/ws/listeners/<listener_id>')
+def ws_listeners_get(listener_id):
+    listener = ws_listener_manager.get_listener(listener_id)
+    if listener is None:
+        response.status = 404
+        response.content_type = 'application/json'
+        return json.dumps({"error": f"Listener '{listener_id}' not found"})
+    response.content_type = 'application/json'
+    return json.dumps({
+        "listener_id": listener.listener_id,
+        "url": listener.url,
+        "status": listener.status,
+        "error_message": listener.error_message,
+        "created_at": listener.created_at.isoformat(),
+        "last_heartbeat": listener.last_heartbeat.isoformat(),
+        "ttl_minutes": listener.ttl_minutes,
+        "max_messages": listener.max_messages,
+        "message_count": _listener_message_count(listener),
+    })
+
+
+@app.get('/v1/ws/listeners/<listener_id>/messages')
+def ws_listeners_messages(listener_id):
+    listener = ws_listener_manager.get_listener(listener_id)
+    if listener is None:
+        response.status = 404
+        response.content_type = 'application/json'
+        return json.dumps({"error": f"Listener '{listener_id}' not found"})
+    session = flaresolverr_service.SESSIONS_STORAGE.sessions.get(listener.session_id)
+    if session is None:
+        response.status = 500
+        response.content_type = 'application/json'
+        return json.dumps({"error": f"Session for listener '{listener_id}' not found"})
+    messages = [msg.__dict__ for msg in list(session.websocket_messages)]
+    session.websocket_messages.clear()
+    response.content_type = 'application/json'
+    return json.dumps(messages)
+
+
+@app.delete('/v1/ws/listeners/<listener_id>')
+def ws_listeners_delete(listener_id):
+    deleted = ws_listener_manager.destroy_listener(listener_id)
+    if not deleted:
+        response.status = 404
+        response.content_type = 'application/json'
+        return json.dumps({"error": f"Listener '{listener_id}' not found"})
+    response.content_type = 'application/json'
+    return json.dumps({"success": True})
+
+
 @app.get('/websocket_messages')
 def get_websocket_messages():
     """
     Returns all collected websocket messages for a given session and clears the queue.
     """
     session_id = request.query.get('session')
-    logging.debug("Received request for /websocket_messages")
-
-    # If a session id is provided, return messages from that session's queue.
-    # If no session id is provided, return messages from the global queue and clear it.
-    messages = []
+    listener_id = request.query.get('listener_id')
+    if listener_id:
+        listener = ws_listener_manager.get_listener(listener_id)
+        if listener is None:
+            response.status = 404
+            response.content_type = 'application/json'
+            return json.dumps({"error": f"Listener with ID '{listener_id}' not found"})
+        session = flaresolverr_service.SESSIONS_STORAGE.sessions.get(listener.session_id)
+        if session is None:
+            response.status = 500
+            response.content_type = 'application/json'
+            return json.dumps({"error": f"Session for listener '{listener_id}' not found"})
+        messages = [msg.__dict__ for msg in list(session.websocket_messages)]
+        session.websocket_messages.clear()
+        response.content_type = 'application/json'
+        return json.dumps(messages)
     if session_id:
         try:
             session, _ = flaresolverr_service.SESSIONS_STORAGE.get(session_id)
@@ -100,211 +203,34 @@ def get_websocket_messages():
             session.websocket_messages.clear()
         except Exception:
             response.status = 404
+            response.content_type = 'application/json'
             return json.dumps({"error": f"Session with ID '{session_id}' not found"})
-    else:
-        messages = [msg.__dict__ for msg in list(WEBSOCKET_MESSAGES)]
-        WEBSOCKET_MESSAGES.clear()
-
+        response.content_type = 'application/json'
+        return json.dumps(messages)
+    response.status = 400
     response.content_type = 'application/json'
-    return json.dumps(messages)
-
-_last_known_url = ""
-_url_cache_time = 0
-
-def _websocket_message_handler(event):
-    global _last_known_url, _url_cache_time
-    params = event['params']
-    frame_type = event['method'].split('.')[-1]  # "webSocketFrameReceived" or "webSocketFrameSent"
-
-    now = time.time()
-    # Cache the URL for 5 seconds to avoid excessive current_url calls
-    if now - _url_cache_time > 5:
-        try:
-            _last_known_url = _websocket_logger_driver.current_url if _websocket_logger_driver else TARGET_URL
-            _url_cache_time = now
-        except Exception:
-            _last_known_url = _last_known_url or TARGET_URL
-
-    url = params.get('url', _last_known_url)
-    payload = params['response']['payloadData'] if 'response' in params and 'payloadData' in params['response'] else \
-              params.get('payloadData', '')
-
-    websocket_msg = flaresolverr_service.WebsocketMessage(
-        timestamp=time.time(),
-        type=frame_type,
-        url=url,
-        payload=payload
-    )
-    WEBSOCKET_MESSAGES.append(websocket_msg)
-    
-    payload_bytes = len(payload.encode('utf-8'))
-    logging.debug(f"Websocket message from {url} {frame_type}: {payload_bytes} bytes")
-    
-    # Track bytes received from websocket
-    if frame_type == "webSocketFrameReceived":
-        WEBSOCKET_BYTES_RECEIVED_TOTAL.labels(url=url).inc(payload_bytes)
-
-
-def _quit_websocket_logger_driver():
-    global _websocket_logger_driver, _websocket_logger_session_id
-    if _websocket_logger_driver:
-        logging.info("Quitting existing WebSocket Logger WebDriver session...")
-        try:
-            logging.debug("Disabling Network domain...")
-            _websocket_logger_driver.execute_cdp_cmd("Network.disable", {})
-            logging.debug("Network domain disabled.")
-        except Exception as e:
-            logging.warning(f"Error while disabling Network domain: {e}")
-        
-        try:
-            logging.debug("Removing CDP websocket frame listeners...")
-            _websocket_logger_driver.remove_cdp_listener("Network.webSocketFrameReceived", _websocket_message_handler)
-            _websocket_logger_driver.remove_cdp_listener("Network.webSocketFrameSent", _websocket_message_handler)
-            logging.debug("CDP websocket frame listeners removed.")
-        except Exception as e:
-            logging.warning(f"Error while removing CDP listeners: {e}")
-        
-        try:
-            logging.debug("Closing WebDriver...")
-            _websocket_logger_driver.quit()
-            logging.info("WebDriver quit successfully.")
-        except Exception as e:
-            logging.warning(f"Error while quitting WebDriver: {e}")
-        
-        _websocket_logger_driver = None
-    
-    if _websocket_logger_session_id:
-        logging.info(f"Destroying session '{_websocket_logger_session_id}' from storage...")
-        try:
-            flaresolverr_service.SESSIONS_STORAGE.destroy(_websocket_logger_session_id)
-            logging.info(f"Session '{_websocket_logger_session_id}' destroyed successfully.")
-        except Exception as e:
-            logging.warning(f"Error while destroying WebSocket Logger session '{_websocket_logger_session_id}': {e}")
-        _websocket_logger_session_id = None
-
-@retry(wait=wait_exponential(multiplier=1, min=2, max=60), stop=stop_after_delay(3600), reraise=True)
-def initialize_websocket_logger_session():
-    global _websocket_logger_driver, _websocket_logger_session_id
-    logging.info(f"Initializing single persistent session for URL: {TARGET_URL}")
-
-    _quit_websocket_logger_driver()
-
-    try:
-        session, fresh = flaresolverr_service.SESSIONS_STORAGE.create(session_id=WEBSOCKET_LOGGER_SESSION_ID, proxy=None)
-        _websocket_logger_session_id = session.session_id
-        _websocket_logger_driver = session.driver
-        logging.info(f"Persistent session '{_websocket_logger_session_id}' created successfully. Fresh: {fresh}")
-
-        _websocket_logger_driver.execute_cdp_cmd("Network.enable", {})
-
-        def _network_event_handler(event):
-            method = event['method']
-            params = event.get('params', {})
-            request_id = params.get('requestId')
-            url = params.get('request', {}).get('url') or params.get('response', {}).get('url') or params.get('redirectResponse', {}).get('url')
-
-            log_message = f"CDP Network (WebSocket Logger): {method}"
-            if request_id:
-                log_message += f" (id: {request_id})"
-            if url:
-                log_message += f" (URL: {url})"
-
-            logging.debug(log_message)
-
-
-        _websocket_logger_driver.add_cdp_listener("Network.requestWillBeSent", _network_event_handler)
-        _websocket_logger_driver.add_cdp_listener("Network.responseReceived", _network_event_handler)
-        _websocket_logger_driver.add_cdp_listener("Network.loadingFinished", _network_event_handler)
-        _websocket_logger_driver.add_cdp_listener("Network.loadingFailed", _network_event_handler)
-        logging.debug("CDP general network event listeners added for WebSocket Logger.")
-
-        _websocket_logger_driver.add_cdp_listener("Network.webSocketFrameReceived", _websocket_message_handler)
-        _websocket_logger_driver.add_cdp_listener("Network.webSocketFrameSent", _websocket_message_handler)
-        logging.info("CDP websocket frame listeners added for WebSocket Logger.")
-
-        logging.info(f"Navigating persistent session to {TARGET_URL}")
-        _websocket_logger_driver.get(TARGET_URL)
-        logging.info(f"Navigation of persistent session to {TARGET_URL} complete.")
-        
-        # Track successful websocket logger session
-        WEBSOCKET_LOGGER_SESSION_TOTAL.labels(url=TARGET_URL).inc()
-
-    except Exception as e:
-        logging.error(f"Failed to initialize persistent session or navigate to URL: {e}", exc_info=True)
-        raise
+    return json.dumps({"error": "Parameter 'listener_id' or 'session' is required."})
 
 def background_tasks_thread():
-    global _websocket_logger_driver
     last_cleanup = 0
-    last_reload = time.time()
-    CLEANUP_INTERVAL = 600 # 10 minutes
+    CLEANUP_INTERVAL = 600
 
     while True:
         now = time.time()
-        
-        # Cleanup stale sessions in the general storage
         if now - last_cleanup >= CLEANUP_INTERVAL:
             try:
                 logging.debug("Triggering periodic stale sessions cleanup...")
                 flaresolverr_service.SESSIONS_STORAGE.cleanup_stale_sessions()
-                last_cleanup = now
             except Exception as e:
                 logging.error(f"Error during stale sessions cleanup: {e}")
+            last_cleanup = now
 
-        # WebSocket Logger management (if TARGET_URL is set)
-        if TARGET_URL:
-            # Check for scheduled reload to prevent memory leaks and stalls
-            if now - last_reload >= SESSION_RELOAD_INTERVAL:
-                logging.info("=" * 80)
-                logging.info("WebSocket Logger session reload interval reached. Reloading to prevent stalls and memory leaks...")
-                logging.info("=" * 80)
-                try:
-                    _quit_websocket_logger_driver()
-                    time.sleep(2) # Give system time to release resources
-                    initialize_websocket_logger_session()
-                    last_reload = time.time()
-                    logging.info("=" * 80)
-                    logging.info("WebSocket Logger session reloaded successfully.")
-                    logging.info("=" * 80)
-                except Exception as e:
-                    logging.error(f"Failed to reload WebSocket Logger session: {e}", exc_info=True)
-            
-            # Health check for the persistent session
-            if _websocket_logger_driver:
-                try:
-                    _ = _websocket_logger_driver.current_url
-                    logging.debug("WebSocket Logger WebDriver session is healthy.")
-                except Exception as e:
-                    logging.error(f"WebSocket Logger WebDriver session became unhealthy: {e}. Attempting to re-initialize session.", exc_info=True)
-                    try:
-                        initialize_websocket_logger_session()
-                        last_reload = time.time() # Reset reload timer if we just re-initialized
-                        logging.info("WebSocket Logger WebDriver session re-initialized successfully.")
-                    except Exception as re_e:
-                        logging.critical(f"Failed to re-initialize WebSocket Logger WebDriver session after multiple retries: {re_e}", exc_info=True)
-            else:
-                logging.debug("WebSocket Logger WebDriver not initialized, waiting for it...")
-                try:
-                    initialize_websocket_logger_session()
-                    last_reload = time.time()
-                    logging.info("WebSocket Logger WebDriver session initialized.")
-                except Exception as re_e:
-                    logging.critical(f"Failed to initialize WebSocket Logger WebDriver session: {re_e}", exc_info=True)
-                    
+        try:
+            ws_listener_manager.cleanup_stale()
+        except Exception as e:
+            logging.error(f"Error during ws listener cleanup: {e}")
+
         time.sleep(SESSION_HEALTH_CHECK_INTERVAL)
-
-@app.get('/websocket_logger/messages')
-def get_websocket_logger_messages():
-    """
-    Returns all collected websocket messages from the persistent logger session and clears the queue.
-    """
-    logging.info("Received request for /websocket_logger/messages")
-    messages = [msg.__dict__ for msg in list(WEBSOCKET_MESSAGES)]
-    WEBSOCKET_MESSAGES.clear()
-    response.content_type = 'application/json'
-    return json.dumps(messages)
-
-
 
 if __name__ == "__main__":
     # check python version
@@ -392,17 +318,5 @@ if __name__ == "__main__":
     background_thread = threading.Thread(target=background_tasks_thread, daemon=True)
     background_thread.start()
     logging.info("Background tasks thread started.")
-
-    # Initialize persistent websocket logger session if TARGET_URL is provided
-    if TARGET_URL:
-        logging.info("TARGET_URL is set. Ensuring initial WebSocket Logger session...")
-        try:
-            if not _websocket_logger_driver:
-                initialize_websocket_logger_session()
-        except Exception as e:
-            logging.critical(f"Initial Persistent WebSocket Logger session failed: {e}")
-            sys.exit(1)
-    else:
-        logging.info("TARGET_URL is not set. Persistent WebSocket Logger session will not be started.")
 
     run(app, host=server_host, port=server_port, quiet=True, server=WaitressServerPoll)

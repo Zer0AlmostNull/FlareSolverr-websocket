@@ -98,6 +98,8 @@ class SessionsStorage:
         session_ids_to_destroy = []
         now = datetime.now()
         for session_id, session in self.sessions.items():
+            if session_id.startswith("ws_listener_"):
+                continue
             if (now - session.last_request_timestamp) > SESSION_INACTIVITY_TIMEOUT:
                 logging.info(
                     f"Session {session_id} inactive for too long. Last activity: {session.last_request_timestamp}. Destroying."

@@ -36,6 +36,18 @@ def get_config_websocket_max_messages() -> int:
     return int(os.environ.get('WEBSOCKET_MAX_MESSAGES', '100'))
 
 
+def get_config_max_ws_listeners() -> int:
+    return int(os.environ.get('MAX_WS_LISTENERS', '5'))
+
+
+def get_config_ws_listener_default_ttl() -> int:
+    return int(os.environ.get('WS_LISTENER_DEFAULT_TTL', '30'))
+
+
+def get_config_ws_listener_default_max_msgs() -> int:
+    return int(os.environ.get('WS_LISTENER_DEFAULT_MAX_MSGS', '500'))
+
+
 def get_flaresolverr_version() -> str:
     global FLARESOLVERR_VERSION
     if FLARESOLVERR_VERSION is not None:
