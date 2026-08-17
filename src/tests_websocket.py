@@ -11,6 +11,8 @@ from webtest import TestApp
 import flaresolverr
 import flaresolverr_service
 import utils
+import metrics
+
 
 
 class TestWebsocketCapture(unittest.TestCase):
@@ -324,6 +326,106 @@ class TestWebSocketListenerEndpoints(unittest.TestCase):
     def test_delete_listener_not_found(self):
         res = self.app.delete('/v1/ws/listeners/nonexistent', status=404)
         self.assertIn("not found", res.json["error"])
+
+
+class TestWebSocketMetrics(unittest.TestCase):
+    def setUp(self):
+        self.manager = flaresolverr_service.WebSocketListenerManager(max_listeners=2)
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+
+    def tearDown(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+
+    def test_create_listener_counts_created_and_active(self):
+        created_before = metrics.WS_LISTENERS_TOTAL.labels(event="created")._value.get()
+        active_before = metrics.WS_LISTENERS_ACTIVE._value.get()
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          return_value=(_make_mock_session(), True)):
+            self.manager.create_listener("https://x.io")
+        self.assertEqual(
+            metrics.WS_LISTENERS_TOTAL.labels(event="created")._value.get(),
+            created_before + 1)
+        self.assertEqual(metrics.WS_LISTENERS_ACTIVE._value.get(), active_before + 1)
+        self.assertEqual(
+            metrics.WS_LISTENERS_STATUS.labels(status="running")._value.get(), 1)
+
+    def test_destroy_listener_counts_destroyed_and_decrements_active(self):
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          return_value=(_make_mock_session(), True)):
+            listener = self.manager.create_listener("https://x.io")
+        destroyed_before = metrics.WS_LISTENERS_TOTAL.labels(event="destroyed")._value.get()
+        active_before = metrics.WS_LISTENERS_ACTIVE._value.get()
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy", return_value=True):
+            self.manager.destroy_listener(listener.listener_id)
+        self.assertEqual(
+            metrics.WS_LISTENERS_TOTAL.labels(event="destroyed")._value.get(),
+            destroyed_before + 1)
+        self.assertEqual(metrics.WS_LISTENERS_ACTIVE._value.get(), active_before - 1)
+
+    def test_cleanup_stale_ttl_expired_counts_event(self):
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          return_value=(_make_mock_session(), True)):
+            listener = self.manager.create_listener("https://x.io")
+        listener.last_heartbeat = datetime.now() - timedelta(minutes=listener.ttl_minutes + 1)
+        expired_before = metrics.WS_LISTENERS_TOTAL.labels(event="ttl_expired")._value.get()
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy", return_value=True):
+            self.manager.cleanup_stale()
+        self.assertEqual(
+            metrics.WS_LISTENERS_TOTAL.labels(event="ttl_expired")._value.get(),
+            expired_before + 1)
+
+    def test_websocket_message_handler_counts_only_when_tracked(self):
+        session = _make_mock_session()
+        session.url_cache_time = 0
+        session.last_known_url = ""
+        received_before = metrics.WS_MESSAGES_TOTAL.labels(
+            url="wss://x.io", type="received")._value.get()
+        flaresolverr_service._websocket_message_handler(session, {
+            "method": "Network.webSocketFrameReceived",
+            "params": {"url": "wss://x.io", "response": {"payloadData": "hi"}},
+        }, track_metrics=True)
+        self.assertEqual(
+            metrics.WS_MESSAGES_TOTAL.labels(url="wss://x.io", type="received")._value.get(),
+            received_before + 1)
+        before2 = metrics.WS_MESSAGES_TOTAL.labels(
+            url="wss://x.io", type="received")._value.get()
+        flaresolverr_service._websocket_message_handler(session, {
+            "method": "Network.webSocketFrameReceived",
+            "params": {"url": "wss://x.io", "response": {"payloadData": "hi"}},
+        }, track_metrics=False)
+        self.assertEqual(
+            metrics.WS_MESSAGES_TOTAL.labels(url="wss://x.io", type="received")._value.get(),
+            before2)
+
+    def test_max_listeners_counts_max_reached(self):
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=[(_make_mock_session("s1"), True),
+                                       (_make_mock_session("s2"), True)]):
+            self.manager.create_listener("https://a.io")
+            self.manager.create_listener("https://b.io")
+        max_before = metrics.WS_LISTENERS_TOTAL.labels(event="max_reached")._value.get()
+        with self.assertRaises(flaresolverr_service.MaxListenersReachedError):
+            self.manager.create_listener("https://c.io")
+        self.assertEqual(
+            metrics.WS_LISTENERS_TOTAL.labels(event="max_reached")._value.get(),
+            max_before + 1)
+
+
+class TestMetricsModule(unittest.TestCase):
+    def test_ws_metric_objects_defined(self):
+        expected = {
+            "WS_LISTENERS_ACTIVE": "flaresolverr_ws_listeners_active",
+            "WS_LISTENERS_STATUS": "flaresolverr_ws_listeners_status",
+            "WS_LISTENERS_TOTAL": "flaresolverr_ws_listeners_total",
+            "WS_RECONNECT_TOTAL": "flaresolverr_ws_reconnect_total",
+            "WS_MESSAGES_TOTAL": "flaresolverr_ws_messages_total",
+            "WS_SESSION_DURATION": "flaresolverr_ws_session_duration_seconds",
+        }
+        from prometheus_client import REGISTRY
+        registered = set(REGISTRY._names_to_collectors.keys())
+        for var_name, metric_name in expected.items():
+            self.assertTrue(hasattr(metrics, var_name), f"missing {var_name}")
+            self.assertIn(metric_name, registered, f"metric {metric_name} not registered")
 
 
 if __name__ == '__main__':

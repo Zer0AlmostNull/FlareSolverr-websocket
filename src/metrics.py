@@ -1,6 +1,6 @@
 import logging
 
-from prometheus_client import Counter, Histogram, start_http_server
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
 import time
 
 REQUEST_COUNTER = Counter(
@@ -25,6 +25,42 @@ WEBSOCKET_BYTES_RECEIVED_TOTAL = Counter(
     name='flaresolverr_websocket_bytes_received_total',
     documentation='Total bytes received from websocket connections',
     labelnames=['url']
+)
+
+WS_LISTENERS_ACTIVE = Gauge(
+    name='flaresolverr_ws_listeners_active',
+    documentation='Current number of active websocket listeners'
+)
+
+WS_LISTENERS_STATUS = Gauge(
+    name='flaresolverr_ws_listeners_status',
+    documentation='Number of websocket listeners per status (starting, running, unhealthy)',
+    labelnames=['status']
+)
+
+WS_LISTENERS_TOTAL = Counter(
+    name='flaresolverr_ws_listeners_total',
+    documentation='Total websocket listener lifecycle events',
+    labelnames=['event']
+)
+
+WS_RECONNECT_TOTAL = Counter(
+    name='flaresolverr_ws_reconnect_total',
+    documentation='Total websocket listener reconnect attempts by result',
+    labelnames=['url', 'result']
+)
+
+WS_MESSAGES_TOTAL = Counter(
+    name='flaresolverr_ws_messages_total',
+    documentation='Total websocket frames captured by listeners',
+    labelnames=['url', 'type']
+)
+
+WS_SESSION_DURATION = Histogram(
+    name='flaresolverr_ws_session_duration_seconds',
+    documentation='Duration of websocket listener sessions in seconds',
+    labelnames=['url'],
+    buckets=[60, 300, 600, 900, 1800, 3600, 7200, 14400]
 )
 
 

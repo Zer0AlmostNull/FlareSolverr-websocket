@@ -21,6 +21,10 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.wait import WebDriverWait
 
 import utils
+from metrics import (
+    WS_LISTENERS_ACTIVE, WS_LISTENERS_STATUS, WS_LISTENERS_TOTAL,
+    WS_RECONNECT_TOTAL, WS_MESSAGES_TOTAL, WS_SESSION_DURATION,
+)
 from dtos import (STATUS_ERROR, STATUS_OK, ChallengeResolutionResultT,
                   ChallengeResolutionT, HealthResponse, IndexResponse,
                   V1RequestBase, V1ResponseBase)
@@ -87,7 +91,7 @@ class WebSocketListener:
 
 # WEBSOCKET_MESSAGES: deque[WebsocketMessage] = deque(maxlen=500)
 
-def _websocket_message_handler(session, event, log_level=logging.INFO):
+def _websocket_message_handler(session, event, log_level=logging.INFO, track_metrics: bool = True):
     params = event['params']
     frame_type = event['method'].split('.')[-1]  # "webSocketFrameReceived" or "webSocketFrameSent"
 
@@ -113,6 +117,9 @@ def _websocket_message_handler(session, event, log_level=logging.INFO):
     )
     session.websocket_messages.append(websocket_msg)
     logging.log(log_level, f"Websocket message {frame_type}: {len(payload.encode('utf-8'))} bytes")
+    if track_metrics:
+        frame_type_label = "received" if frame_type == "webSocketFrameReceived" else "sent"
+        WS_MESSAGES_TOTAL.labels(url=url, type=frame_type_label).inc()
 
 
 def _register_listener_cdp(session):
@@ -142,6 +149,7 @@ class WebSocketListenerManager:
             raise ValueError("Field 'url' is mandatory.")
         with self._lock:
             if len(self.listeners) >= self.max_listeners:
+                WS_LISTENERS_TOTAL.labels(event="max_reached").inc()
                 raise MaxListenersReachedError(
                     f"Max listeners reached ({self.max_listeners})")
             ttl_minutes = ttl_minutes or utils.get_config_ws_listener_default_ttl()
@@ -162,17 +170,30 @@ class WebSocketListenerManager:
                 status="starting",
             )
             self.listeners[listener_id] = listener
+            WS_LISTENERS_TOTAL.labels(event="created").inc()
         try:
             session.driver.get(url)
         except Exception:
             self.listeners.pop(listener_id, None)
+            WS_LISTENERS_TOTAL.labels(event="destroyed").inc()
             try:
                 SESSIONS_STORAGE.destroy(listener.session_id)
             except Exception:
                 pass
+            self._update_gauges()
             raise
         listener.status = "running"
+        self._update_gauges()
         return listener
+
+    def _update_gauges(self):
+        WS_LISTENERS_ACTIVE.set(len(self.listeners))
+        status_counts = {"starting": 0, "running": 0, "unhealthy": 0}
+        for listener in list(self.listeners.values()):
+            if listener.status in status_counts:
+                status_counts[listener.status] += 1
+        for status, count in status_counts.items():
+            WS_LISTENERS_STATUS.labels(status=status).set(count)
 
     def get_listener(self, listener_id: str) -> WebSocketListener | None:
         with self._lock:
@@ -193,6 +214,10 @@ class WebSocketListenerManager:
             SESSIONS_STORAGE.destroy(listener.session_id)
         except Exception as e:
             logging.warning(f"Error destroying session for listener {listener_id}: {e}")
+        WS_LISTENERS_TOTAL.labels(event="destroyed").inc()
+        WS_SESSION_DURATION.labels(url=listener.url).observe(
+            (datetime.now() - listener.created_at).total_seconds())
+        self._update_gauges()
         return True
 
     def cleanup_stale(self):
@@ -201,11 +226,13 @@ class WebSocketListenerManager:
             if (now - listener.last_heartbeat) > timedelta(minutes=listener.ttl_minutes):
                 logging.info(f"Listener {listener_id} inactive for "
                              f"{listener.ttl_minutes} min. Destroying.")
+                WS_LISTENERS_TOTAL.labels(event="ttl_expired").inc()
                 self.destroy_listener(listener_id)
                 continue
             session = self._get_session(listener)
             if session is None:
                 logging.warning(f"Listener {listener_id}: session missing. Destroying.")
+                WS_LISTENERS_TOTAL.labels(event="session_missing").inc()
                 self.destroy_listener(listener_id)
                 continue
             try:
@@ -222,6 +249,7 @@ class WebSocketListenerManager:
                     self.destroy_listener(listener_id)
                 else:
                     self._reconnect_listener(listener)
+        self._update_gauges()
 
     def _reconnect_listener(self, listener: WebSocketListener):
         listener.reconnect_attempts += 1
@@ -234,10 +262,14 @@ class WebSocketListenerManager:
             if listener.listener_id in self.listeners:
                 listener.status = "running"
                 listener.error_message = ""
+                WS_RECONNECT_TOTAL.labels(url=listener.url, result="success").inc()
             else:
                 SESSIONS_STORAGE.destroy(listener.session_id)
+                WS_RECONNECT_TOTAL.labels(url=listener.url, result="failed").inc()
+                WS_LISTENERS_TOTAL.labels(event="max_reconnect_reached").inc()
         except Exception as e:
             listener.error_message = f"Reconnect failed: {e}"
+            WS_RECONNECT_TOTAL.labels(url=listener.url, result="failed").inc()
 
 
 def test_browser_installation():
@@ -437,8 +469,8 @@ def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
             # We only want to listen for websocket messages if a session is provided
             if session:
                 driver.execute_cdp_cmd("Network.enable", {})
-                _session_websocket_message_handler_received = lambda event: _websocket_message_handler(session, event)
-                _session_websocket_message_handler_sent = lambda event: _websocket_message_handler(session, event)
+                _session_websocket_message_handler_received = lambda event: _websocket_message_handler(session, event, track_metrics=False)
+                _session_websocket_message_handler_sent = lambda event: _websocket_message_handler(session, event, track_metrics=False)
                 driver.add_cdp_listener("Network.webSocketFrameReceived", _session_websocket_message_handler_received)
                 driver.add_cdp_listener("Network.webSocketFrameSent", _session_websocket_message_handler_sent)
                 logging.debug("CDP websocket frame listeners added.")
