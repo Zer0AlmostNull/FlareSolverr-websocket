@@ -12,7 +12,7 @@ REQUEST_DURATION = Histogram(
     name='flaresolverr_request_duration',
     documentation='Request duration in seconds',
     labelnames=['domain'],
-    buckets=[0, 10, 25, 50]
+    buckets=[10, 30, 60, 120, 300, 600]
 )
 
 WEBSOCKET_LOGGER_SESSION_TOTAL = Counter(
