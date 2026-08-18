@@ -24,6 +24,7 @@ import utils
 from metrics import (
     WS_LISTENERS_ACTIVE, WS_LISTENERS_STATUS, WS_LISTENERS_TOTAL,
     WS_RECONNECT_TOTAL, WS_MESSAGES_TOTAL, WS_SESSION_DURATION,
+    WS_LISTENER_ACTIVE, WS_LISTENER_UPTIME, WS_LISTENER_TOTAL_ACTIVE, WS_LISTENER_LAST_SEEN,
 )
 from dtos import (STATUS_ERROR, STATUS_OK, ChallengeResolutionResultT,
                   ChallengeResolutionT, HealthResponse, IndexResponse,
@@ -184,6 +185,7 @@ class WebSocketListenerManager:
             raise
         listener.status = "running"
         self._update_gauges()
+        self._update_per_url_metrics()
         return listener
 
     def _update_gauges(self):
@@ -194,6 +196,22 @@ class WebSocketListenerManager:
                 status_counts[listener.status] += 1
         for status, count in status_counts.items():
             WS_LISTENERS_STATUS.labels(status=status).set(count)
+
+    def _update_per_url_metrics(self):
+        now = datetime.now()
+        # group listeners by url
+        by_url: dict[str, WebSocketListener] = {}
+        for lst in list(self.listeners.values()):
+            # keep the most recently created listener per url as "primary"
+            if lst.url not in by_url or lst.created_at > by_url[lst.url].created_at:
+                by_url[lst.url] = lst
+        for url, lst in by_url.items():
+            is_active = lst.status in ("running", "starting")
+            WS_LISTENER_ACTIVE.labels(url=url).set(1 if is_active else 0)
+            WS_LISTENER_LAST_SEEN.labels(url=url).set(now.timestamp())
+            if is_active:
+                WS_LISTENER_UPTIME.labels(url=url).set(
+                    (now - lst.created_at).total_seconds())
 
     def get_listener(self, listener_id: str) -> WebSocketListener | None:
         with self._lock:
@@ -217,6 +235,9 @@ class WebSocketListenerManager:
         WS_LISTENERS_TOTAL.labels(event="destroyed").inc()
         WS_SESSION_DURATION.labels(url=listener.url).observe(
             (datetime.now() - listener.created_at).total_seconds())
+        WS_LISTENER_TOTAL_ACTIVE.labels(url=listener.url).inc(
+            (datetime.now() - listener.created_at).total_seconds())
+        WS_LISTENER_ACTIVE.labels(url=listener.url).set(0)
         self._update_gauges()
         return True
 
@@ -250,6 +271,7 @@ class WebSocketListenerManager:
                 else:
                     self._reconnect_listener(listener)
         self._update_gauges()
+        self._update_per_url_metrics()
 
     def _reconnect_listener(self, listener: WebSocketListener):
         listener.reconnect_attempts += 1
