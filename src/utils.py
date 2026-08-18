@@ -48,6 +48,10 @@ def get_config_ws_listener_default_max_msgs() -> int:
     return int(os.environ.get('WS_LISTENER_DEFAULT_MAX_MSGS', '500'))
 
 
+def get_config_ws_listener_create_timeout() -> int:
+    return int(os.environ.get('WS_LISTENER_CREATE_TIMEOUT', '90'))
+
+
 def get_flaresolverr_version() -> str:
     global FLARESOLVERR_VERSION
     if FLARESOLVERR_VERSION is not None:

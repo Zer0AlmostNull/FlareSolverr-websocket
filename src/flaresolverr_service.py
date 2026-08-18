@@ -4,7 +4,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from html import escape
 from urllib.parse import unquote, quote
@@ -80,13 +80,13 @@ class WebsocketMessage:
 @dataclass
 class WebSocketListener:
     listener_id: str
-    session_id: str
-    url: str
-    created_at: datetime
-    last_heartbeat: datetime
+    session_id: str = ""
+    url: str = ""
+    created_at: datetime = field(default_factory=datetime.now)
+    last_heartbeat: datetime = field(default_factory=datetime.now)
     ttl_minutes: int = 30
     max_messages: int = 500
-    status: str = "starting"  # starting | running | unhealthy
+    status: str = "starting"  # starting | running | unhealthy | failed
     error_message: str = ""
     reconnect_attempts: int = 0
 
@@ -139,6 +139,7 @@ class WebSocketListenerManager:
     def __init__(self, max_listeners: int = 5):
         self.listeners: dict[str, WebSocketListener] = {}
         self.max_listeners = max_listeners
+        self._url_index: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def _get_session(self, listener: WebSocketListener):
@@ -156,13 +157,10 @@ class WebSocketListenerManager:
             ttl_minutes = ttl_minutes or utils.get_config_ws_listener_default_ttl()
             max_messages = max_messages or utils.get_config_ws_listener_default_max_msgs()
             listener_id = str(uuid4())
-            session, _ = SESSIONS_STORAGE.create(session_id=f"ws_listener_{listener_id}")
-            session.websocket_messages = deque(maxlen=max_messages)
-            _register_listener_cdp(session)
             now = datetime.now()
             listener = WebSocketListener(
                 listener_id=listener_id,
-                session_id=session.session_id,
+                session_id="",
                 url=url,
                 created_at=now,
                 last_heartbeat=now,
@@ -171,22 +169,120 @@ class WebSocketListenerManager:
                 status="starting",
             )
             self.listeners[listener_id] = listener
+            self._url_index[url] = listener_id
             WS_LISTENERS_TOTAL.labels(event="created").inc()
+            self._update_gauges()
+        # Browser work (Chrome launch + page load) happens OFF the lock.
+        # _start_session cleans up and re-raises on failure.
+        self._start_session(listener, url, max_messages)
+        return listener
+
+    def _start_session(self, listener: WebSocketListener, url: str, max_messages: int):
         try:
-            session.driver.get(url)
-        except Exception:
-            self.listeners.pop(listener_id, None)
-            WS_LISTENERS_TOTAL.labels(event="destroyed").inc()
+            session, _ = SESSIONS_STORAGE.create(session_id=f"ws_listener_{listener.listener_id}")
+            session.websocket_messages = deque(maxlen=max_messages)
+            _register_listener_cdp(session)
+            create_timeout = utils.get_config_ws_listener_create_timeout()
             try:
-                SESSIONS_STORAGE.destroy(listener.session_id)
+                func_timeout(create_timeout, session.driver.get, (url,))
+            except FunctionTimedOut:
+                raise Exception(f"Timed out loading {url} after {create_timeout}s")
+            with self._lock:
+                if listener.listener_id in self.listeners:
+                    listener.session_id = session.session_id
+                    listener.status = "running"
+                    listener.error_message = ""
+            self._update_gauges()
+            self._update_per_url_metrics()
+        except Exception as e:
+            logging.error(f"Failed to start WS listener {listener.listener_id} for {url}: {e}")
+            with self._lock:
+                self.listeners.pop(listener.listener_id, None)
+                self._url_index.pop(url, None)
+                listener.status = "failed"
+                listener.error_message = str(e)
+            try:
+                SESSIONS_STORAGE.destroy(f"ws_listener_{listener.listener_id}")
             except Exception:
                 pass
             self._update_gauges()
             raise
-        listener.status = "running"
-        self._update_gauges()
-        self._update_per_url_metrics()
+
+    def ensure_listener_for_url(self, url: str, ttl_minutes: int = None,
+                                max_messages: int = None) -> WebSocketListener:
+        if not url:
+            raise ValueError("Field 'url' is mandatory.")
+        with self._lock:
+            if url in self._url_index:
+                lid = self._url_index[url]
+                listener = self.listeners.get(lid)
+                if listener is not None:
+                    listener.last_heartbeat = datetime.now()
+                    return listener
+            if len(self.listeners) >= self.max_listeners:
+                WS_LISTENERS_TOTAL.labels(event="max_reached").inc()
+                raise MaxListenersReachedError(
+                    f"Max listeners reached ({self.max_listeners})")
+            ttl_minutes = ttl_minutes or utils.get_config_ws_listener_default_ttl()
+            max_messages = max_messages or utils.get_config_ws_listener_default_max_msgs()
+            listener_id = str(uuid4())
+            now = datetime.now()
+            listener = WebSocketListener(
+                listener_id=listener_id,
+                session_id="",
+                url=url,
+                created_at=now,
+                last_heartbeat=now,
+                ttl_minutes=ttl_minutes,
+                max_messages=max_messages,
+                status="starting",
+            )
+            self.listeners[listener_id] = listener
+            self._url_index[url] = listener_id
+            WS_LISTENERS_TOTAL.labels(event="created").inc()
+            self._update_gauges()
+        t = threading.Thread(target=self._start_session,
+                             args=(listener, url, max_messages), daemon=True)
+        t.start()
         return listener
+
+    def _locked_get(self, listener_id: str):
+        with self._lock:
+            listener = self.listeners.get(listener_id)
+            if listener is not None:
+                listener.last_heartbeat = datetime.now()
+            return listener
+
+    def _drain(self, listener_id: str):
+        with self._lock:
+            listener = self.listeners.get(listener_id)
+            if listener is None:
+                return None
+            if not listener.session_id:
+                return []
+            session = SESSIONS_STORAGE.sessions.get(listener.session_id)
+            if session is None:
+                return []
+            messages = [msg.__dict__ for msg in list(session.websocket_messages)]
+            session.websocket_messages.clear()
+            return messages
+
+    def get_listener_payload(self, listener_id: str):
+        listener = self._locked_get(listener_id)
+        if listener is None:
+            return None
+        messages = self._drain(listener_id)
+        return {
+            "status": listener.status,
+            "messages": messages or [],
+        }
+
+    def ensure_and_fetch(self, url: str):
+        listener = self.ensure_listener_for_url(url)
+        return self.get_listener_payload(listener.listener_id)
+
+    def get_listener(self, listener_id: str) -> WebSocketListener | None:
+        return self._locked_get(listener_id)
 
     def _update_gauges(self):
         WS_LISTENERS_ACTIVE.set(len(self.listeners))
@@ -214,11 +310,7 @@ class WebSocketListenerManager:
                     (now - lst.created_at).total_seconds())
 
     def get_listener(self, listener_id: str) -> WebSocketListener | None:
-        with self._lock:
-            listener = self.listeners.get(listener_id)
-            if listener is not None:
-                listener.last_heartbeat = datetime.now()
-            return listener
+        return self._locked_get(listener_id)
 
     def list_listeners(self) -> list[WebSocketListener]:
         return list(self.listeners.values())
@@ -228,6 +320,7 @@ class WebSocketListenerManager:
             listener = self.listeners.pop(listener_id, None)
             if listener is None:
                 return False
+            self._url_index.pop(listener.url, None)
         try:
             SESSIONS_STORAGE.destroy(listener.session_id)
         except Exception as e:
@@ -246,6 +339,10 @@ class WebSocketListenerManager:
     def cleanup_stale(self):
         now = datetime.now()
         for listener_id, listener in list(self.listeners.items()):
+            # A listener still in 'starting' has no session attached yet
+            # (background _start_session is mid-flight). Never reap it here.
+            if not listener.session_id:
+                continue
             if (now - listener.last_heartbeat) > timedelta(minutes=listener.ttl_minutes):
                 logging.info(f"Listener {listener_id} inactive for "
                              f"{listener.ttl_minutes} min. Destroying.")

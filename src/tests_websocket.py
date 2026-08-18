@@ -18,24 +18,21 @@ import metrics
 class TestWebsocketCapture(unittest.TestCase):
     def setUp(self):
         self.app = TestApp(flaresolverr.app)
-        flaresolverr.ws_listener_manager.listeners.clear()
+        self.manager = flaresolverr.ws_listener_manager
+        self.manager.listeners.clear()
+        self.manager._url_index.clear()
+        self._create_patch = patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                                          return_value=(_make_mock_session(), True))
+        self._create_patch.start()
 
     def tearDown(self):
-        flaresolverr.ws_listener_manager.listeners.clear()
+        self._create_patch.stop()
+        self.manager.listeners.clear()
+        self.manager._url_index.clear()
 
     def test_messages_without_listener_id_returns_400(self):
         res = self.app.get('/websocket_messages', status=400)
-        self.assertIn("listener_id", res.json["error"])
-
-    def test_session_endpoint_returns_and_clears_session_queue(self):
-        session = SimpleNamespace(websocket_messages=deque([
-            flaresolverr_service.WebsocketMessage(2.0, "sent", "wss://example.test", "out")
-        ]))
-        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "get", return_value=(session, False)):
-            response = self.app.get('/websocket_messages?session=session-1')
-
-        self.assertEqual(response.json[0]["payload"], "out")
-        self.assertEqual(len(session.websocket_messages), 0)
+        self.assertIn("url", res.json["error"])
 
     def test_capture_extracts_frame_type_url_and_payload(self):
         session = SimpleNamespace(
@@ -70,59 +67,63 @@ class TestWebsocketCapture(unittest.TestCase):
         self.assertEqual(listener.status, "starting")
         self.assertEqual(listener.error_message, "")
 
-    def test_listener_messages_listener_not_found_returns_404(self):
-        res = self.app.get('/v1/ws/listeners/nonexistent/messages', status=404)
-        self.assertIn("not found", res.json["error"])
-
-    def test_listener_messages_returns_and_clears(self):
+    def test_websocket_messages_creates_listener_for_url(self):
         session = _make_mock_session()
         with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
                           return_value=(session, True)):
-            listener = flaresolverr.ws_listener_manager.create_listener("https://x.io")
+            res = self.app.get('/websocket_messages?url=https://x.io')
+        self.assertEqual(res.status_int, 200)
+        self.assertIn("status", res.json)
+        self.assertIn(res.json["status"], ("starting", "running"))
+        self.assertNotIn("listener_id", res.json)
+        self.assertNotIn("url", res.json)
+        self.assertEqual(res.json["messages"], [])
+
+    def test_websocket_messages_url_idempotent(self):
+        session = _make_mock_session()
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          return_value=(session, True)):
+            self.app.get('/websocket_messages?url=https://x.io')
+            self.app.get('/websocket_messages?url=https://x.io')
+        self.assertEqual(len(flaresolverr.ws_listener_manager.listeners), 1)
+
+    def test_websocket_messages_url_returns_status_and_messages(self):
+        session = _make_mock_session()
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          return_value=(session, True)):
+            self.app.get('/websocket_messages?url=https://x.io')
         flaresolverr_service.SESSIONS_STORAGE.sessions[session.session_id] = session
+        for _ in range(50):
+            if flaresolverr.ws_listener_manager.listeners and \
+               next(iter(flaresolverr.ws_listener_manager.listeners.values())).status == "running":
+                break
+            time.sleep(0.01)
         session.websocket_messages.append(
-            flaresolverr_service.WebsocketMessage(1.0, "received", "wss://x.io", "data")
-        )
-        res = self.app.get(f'/v1/ws/listeners/{listener.listener_id}/messages')
-        self.assertEqual(res.json[0]["type"], "received")
+            flaresolverr_service.WebsocketMessage(1.0, "received", "wss://x.io", "data"))
+        res = self.app.get('/websocket_messages?url=https://x.io')
+        self.assertEqual(res.json["status"], "running")
+        self.assertEqual(res.json["messages"][0]["payload"], "data")
         self.assertEqual(len(session.websocket_messages), 0)
 
-    def test_messages_with_listener_id_returns_and_clears(self):
+    def test_websocket_messages_url_drains_and_clears(self):
         session = _make_mock_session()
         with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
                           return_value=(session, True)):
-            listener = flaresolverr.ws_listener_manager.create_listener("https://x.io")
+            self.app.get('/websocket_messages?url=https://x.io')
         flaresolverr_service.SESSIONS_STORAGE.sessions[session.session_id] = session
+        for _ in range(50):
+            if flaresolverr.ws_listener_manager.listeners and \
+               next(iter(flaresolverr.ws_listener_manager.listeners.values())).status == "running":
+                break
+            time.sleep(0.01)
         session.websocket_messages.append(
-            flaresolverr_service.WebsocketMessage(2.0, "sent", "wss://x.io", "out")
-        )
-        res = self.app.get(f'/websocket_messages?listener_id={listener.listener_id}')
-        self.assertEqual(res.json[0]["payload"], "out")
-        self.assertEqual(len(session.websocket_messages), 0)
-
-    def test_messages_with_unknown_listener_id_returns_404(self):
-        res = self.app.get('/websocket_messages?listener_id=nonexistent', status=404)
-        self.assertIn("not found", res.json["error"])
-
-    def test_listeners_create_endpoint(self):
-        session = _make_mock_session()
-        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
-                          return_value=(session, True)):
-            res = self.app.post_json('/v1/ws/listeners',
-                                     {"url": "https://x.io"})
-        self.assertEqual(res.status_int, 200)
-        self.assertIn("listener_id", res.json)
-        self.assertEqual(res.json["url"], "https://x.io")
-
-    def test_listeners_list_endpoint(self):
-        session = _make_mock_session()
-        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
-                          return_value=(session, True)):
-            flaresolverr.ws_listener_manager.create_listener("https://x.io")
-        res = self.app.get('/v1/ws/listeners')
-        self.assertEqual(res.status_int, 200)
-        self.assertEqual(len(res.json), 1)
-        self.assertEqual(res.json[0]["url"], "https://x.io")
+            flaresolverr_service.WebsocketMessage(1.0, "received", "wss://x.io", "a"))
+        session.websocket_messages.append(
+            flaresolverr_service.WebsocketMessage(2.0, "received", "wss://x.io", "b"))
+        r1 = self.app.get('/websocket_messages?url=https://x.io')
+        self.assertEqual([m["payload"] for m in r1.json["messages"]], ["a", "b"])
+        r2 = self.app.get('/websocket_messages?url=https://x.io')
+        self.assertEqual(r2.json["messages"], [])
 
 
 def _make_mock_session(session_id="s1", maxlen=500):
@@ -224,12 +225,21 @@ class TestWebSocketListenerManager(unittest.TestCase):
 
     def test_create_listener_respects_max(self):
         with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
-                         side_effect=[(_make_mock_session("s1"), True),
-                                      (_make_mock_session("s2"), True)]):
+                          side_effect=[(_make_mock_session("s1"), True),
+                                       (_make_mock_session("s2"), True)]):
             self.manager.create_listener("https://a.io")
             self.manager.create_listener("https://b.io")
             with self.assertRaises(flaresolverr_service.MaxListenersReachedError):
                 self.manager.create_listener("https://c.io")
+
+    def test_ensure_listener_for_url_raises_at_max(self):
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=[(_make_mock_session("s1"), True),
+                                       (_make_mock_session("s2"), True)]):
+            self.manager.ensure_listener_for_url("https://a.io")
+            self.manager.ensure_listener_for_url("https://b.io")
+        with self.assertRaises(flaresolverr_service.MaxListenersReachedError):
+            self.manager.ensure_listener_for_url("https://c.io")
 
     def test_create_requires_url(self):
         with self.assertRaises(ValueError):
@@ -285,65 +295,27 @@ class TestWebSocketListenerEndpoints(unittest.TestCase):
         self._orig_create = flaresolverr_service.SESSIONS_STORAGE.create
         self._orig_destroy = flaresolverr_service.SESSIONS_STORAGE.destroy
         self.manager.listeners.clear()
+        self.manager._url_index.clear()
+        self._create_patch = patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                                          return_value=(_make_mock_session(), True))
+        self._create_patch.start()
 
     def tearDown(self):
+        self._create_patch.stop()
         flaresolverr_service.SESSIONS_STORAGE.create = self._orig_create
         flaresolverr_service.SESSIONS_STORAGE.destroy = self._orig_destroy
         flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
         self.manager.listeners.clear()
+        self.manager._url_index.clear()
 
-    def test_create_listener(self):
+    def test_create_listener_via_get(self):
         session = _make_mock_session()
         with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
                           return_value=(session, True)):
-            res = self.app.post_json('/v1/ws/listeners',
-                                     {"url": "https://x.io"})
+            res = self.app.get('/websocket_messages?url=https://x.io')
         self.assertEqual(res.status_int, 200)
-        self.assertEqual(res.json["url"], "https://x.io")
-        self.assertEqual(res.json["status"], "running")
-
-    def test_list_listeners(self):
-        session = _make_mock_session()
-        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
-                          return_value=(session, True)):
-            self.manager.create_listener("https://x.io")
-        res = self.app.get('/v1/ws/listeners')
-        self.assertEqual(res.status_int, 200)
-        self.assertEqual(len(res.json), 1)
-        self.assertEqual(res.json[0]["url"], "https://x.io")
-        self.assertIn("message_count", res.json[0])
-
-    def test_get_listener(self):
-        session = _make_mock_session()
-        flaresolverr_service.SESSIONS_STORAGE.sessions["s1"] = session
-        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
-                          return_value=(session, True)):
-            listener = self.manager.create_listener("https://x.io")
-        res = self.app.get(f'/v1/ws/listeners/{listener.listener_id}')
-        self.assertEqual(res.status_int, 200)
-        self.assertEqual(res.json["url"], "https://x.io")
-        self.assertIn("ttl_minutes", res.json)
-        self.assertIn("max_messages", res.json)
-        self.assertIn("message_count", res.json)
-
-    def test_get_listener_not_found(self):
-        res = self.app.get('/v1/ws/listeners/nonexistent', status=404)
-        self.assertIn("not found", res.json["error"])
-
-    def test_delete_listener(self):
-        session = _make_mock_session()
-        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
-                          return_value=(session, True)):
-            listener = self.manager.create_listener("https://x.io")
-        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
-                          return_value=True):
-            res = self.app.delete(f'/v1/ws/listeners/{listener.listener_id}')
-        self.assertEqual(res.status_int, 200)
-        self.assertTrue(res.json["success"])
-
-    def test_delete_listener_not_found(self):
-        res = self.app.delete('/v1/ws/listeners/nonexistent', status=404)
-        self.assertIn("not found", res.json["error"])
+        self.assertIn(res.json["status"], ("starting", "running"))
+        self.assertNotIn("listener_id", res.json)
 
 
 class TestWebSocketMetrics(unittest.TestCase):

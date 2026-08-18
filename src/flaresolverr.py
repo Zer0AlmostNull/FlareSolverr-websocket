@@ -11,7 +11,6 @@ from bottle import run, response, Bottle, request, ServerAdapter
 from bottle_plugins.error_plugin import error_plugin
 from bottle_plugins.logger_plugin import logger_plugin
 from bottle_plugins import prometheus_plugin
-from metrics import WEBSOCKET_LOGGER_SESSION_TOTAL
 from dtos import V1RequestBase, HealthResponse, STATUS_OK # Added HealthResponse, STATUS_OK
 import flaresolverr_service
 import utils
@@ -75,141 +74,27 @@ def controller_v1():
         response.status = 500
     return utils.object_to_dict(res)
 
-def _listener_message_count(listener):
-    session = flaresolverr_service.SESSIONS_STORAGE.sessions.get(listener.session_id)
-    return len(session.websocket_messages) if session else 0
-
-
-@app.post('/v1/ws/listeners')
-def ws_listeners_create():
-    data = request.json or {}
-    try:
-        listener = ws_listener_manager.create_listener(
-            url=data.get('url'),
-            ttl_minutes=data.get('ttl_minutes'),
-            max_messages=data.get('max_messages'),
-        )
-    except flaresolverr_service.MaxListenersReachedError as e:
-        response.status = 429
-        response.content_type = 'application/json'
-        return json.dumps({"error": str(e)})
-    except ValueError as e:
-        response.status = 400
-        response.content_type = 'application/json'
-        return json.dumps({"error": str(e)})
-    except Exception as e:
-        logging.error(f"Failed to create ws listener for {data.get('url')}: {e}")
-        response.status = 500
-        response.content_type = 'application/json'
-        return json.dumps({"error": str(e)})
-    WEBSOCKET_LOGGER_SESSION_TOTAL.labels(url=listener.url).inc()
-    response.content_type = 'application/json'
-    return json.dumps({
-        "listener_id": listener.listener_id,
-        "status": listener.status,
-        "url": listener.url,
-    })
-
-
-@app.get('/v1/ws/listeners')
-def ws_listeners_list():
-    listeners = ws_listener_manager.list_listeners()
-    response.content_type = 'application/json'
-    return json.dumps([{
-        "listener_id": l.listener_id,
-        "url": l.url,
-        "status": l.status,
-        "created_at": l.created_at.isoformat(),
-        "message_count": _listener_message_count(l),
-    } for l in listeners])
-
-
-@app.get('/v1/ws/listeners/<listener_id>')
-def ws_listeners_get(listener_id):
-    listener = ws_listener_manager.get_listener(listener_id)
-    if listener is None:
-        response.status = 404
-        response.content_type = 'application/json'
-        return json.dumps({"error": f"Listener '{listener_id}' not found"})
-    response.content_type = 'application/json'
-    return json.dumps({
-        "listener_id": listener.listener_id,
-        "url": listener.url,
-        "status": listener.status,
-        "error_message": listener.error_message,
-        "created_at": listener.created_at.isoformat(),
-        "last_heartbeat": listener.last_heartbeat.isoformat(),
-        "ttl_minutes": listener.ttl_minutes,
-        "max_messages": listener.max_messages,
-        "message_count": _listener_message_count(listener),
-    })
-
-
-@app.get('/v1/ws/listeners/<listener_id>/messages')
-def ws_listeners_messages(listener_id):
-    listener = ws_listener_manager.get_listener(listener_id)
-    if listener is None:
-        response.status = 404
-        response.content_type = 'application/json'
-        return json.dumps({"error": f"Listener '{listener_id}' not found"})
-    session = flaresolverr_service.SESSIONS_STORAGE.sessions.get(listener.session_id)
-    if session is None:
-        response.status = 500
-        response.content_type = 'application/json'
-        return json.dumps({"error": f"Session for listener '{listener_id}' not found"})
-    messages = [msg.__dict__ for msg in list(session.websocket_messages)]
-    session.websocket_messages.clear()
-    response.content_type = 'application/json'
-    return json.dumps(messages)
-
-
-@app.delete('/v1/ws/listeners/<listener_id>')
-def ws_listeners_delete(listener_id):
-    deleted = ws_listener_manager.destroy_listener(listener_id)
-    if not deleted:
-        response.status = 404
-        response.content_type = 'application/json'
-        return json.dumps({"error": f"Listener '{listener_id}' not found"})
-    response.content_type = 'application/json'
-    return json.dumps({"success": True})
-
-
 @app.get('/websocket_messages')
 def get_websocket_messages():
     """
-    Returns all collected websocket messages for a given session and clears the queue.
+    Ensures a WebSocket listener exists for the given URL (creating it in the
+    background on first use) and returns its collected messages (drained).
+
+    Response: {"status": "starting|running|unhealthy|failed", "messages": [...]}
     """
-    session_id = request.query.get('session')
-    listener_id = request.query.get('listener_id')
-    if listener_id:
-        listener = ws_listener_manager.get_listener(listener_id)
-        if listener is None:
-            response.status = 404
-            response.content_type = 'application/json'
-            return json.dumps({"error": f"Listener with ID '{listener_id}' not found"})
-        session = flaresolverr_service.SESSIONS_STORAGE.sessions.get(listener.session_id)
-        if session is None:
-            response.status = 500
-            response.content_type = 'application/json'
-            return json.dumps({"error": f"Session for listener '{listener_id}' not found"})
-        messages = [msg.__dict__ for msg in list(session.websocket_messages)]
-        session.websocket_messages.clear()
+    url = request.query.get('url')
+    if not url:
+        response.status = 400
         response.content_type = 'application/json'
-        return json.dumps(messages)
-    if session_id:
-        try:
-            session, _ = flaresolverr_service.SESSIONS_STORAGE.get(session_id)
-            messages = [msg.__dict__ for msg in list(session.websocket_messages)]
-            session.websocket_messages.clear()
-        except Exception:
-            response.status = 404
-            response.content_type = 'application/json'
-            return json.dumps({"error": f"Session with ID '{session_id}' not found"})
+        return json.dumps({"error": "Parameter 'url' is required."})
+    try:
+        payload = ws_listener_manager.ensure_and_fetch(url)
+    except flaresolverr_service.MaxListenersReachedError:
+        response.status = 429
         response.content_type = 'application/json'
-        return json.dumps(messages)
-    response.status = 400
+        return json.dumps({"error": "Max listeners reached"})
     response.content_type = 'application/json'
-    return json.dumps({"error": "Parameter 'listener_id' or 'session' is required."})
+    return json.dumps(payload)
 
 def background_tasks_thread():
     last_cleanup = 0
