@@ -238,6 +238,8 @@ class WebSocketListenerManager:
         WS_LISTENER_TOTAL_ACTIVE.labels(url=listener.url).inc(
             (datetime.now() - listener.created_at).total_seconds())
         WS_LISTENER_ACTIVE.labels(url=listener.url).set(0)
+        WS_LISTENER_UPTIME.labels(url=listener.url).set(0)
+        WS_LISTENER_LAST_SEEN.labels(url=listener.url).set(0)
         self._update_gauges()
         return True
 
