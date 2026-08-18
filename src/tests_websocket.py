@@ -259,6 +259,24 @@ class TestWebSocketListenerManager(unittest.TestCase):
     def test_destroy_missing_returns_false(self):
         self.assertFalse(self.manager.destroy_listener("nope"))
 
+    def test_create_and_cleanup_emits_per_url_metrics(self):
+        from metrics import WS_LISTENER_ACTIVE, WS_LISTENER_LAST_SEEN, WS_LISTENER_UPTIME
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        url = 'https://mevx.io/?chain=solana'
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          return_value=(_make_mock_session(), True)):
+            listener = mgr.create_listener(url)
+        try:
+            # active=1, last_seen set, uptime >= 0
+            self.assertEqual(WS_LISTENER_ACTIVE.labels(url=url)._value.get(), 1)
+            self.assertGreater(WS_LISTENER_LAST_SEEN.labels(url=url)._value.get(), 0)
+            self.assertGreaterEqual(WS_LISTENER_UPTIME.labels(url=url)._value.get(), 0)
+        finally:
+            with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy", return_value=True):
+                mgr.destroy_listener(listener.listener_id)
+        # after destroy active goes to 0
+        self.assertEqual(WS_LISTENER_ACTIVE.labels(url=url)._value.get(), 0)
+
 
 class TestWebSocketListenerEndpoints(unittest.TestCase):
     def setUp(self):
@@ -412,6 +430,21 @@ class TestWebSocketMetrics(unittest.TestCase):
 
 
 class TestMetricsModule(unittest.TestCase):
+    def test_new_metrics_registered_with_url_label(self):
+        from metrics import (
+            WS_LISTENER_ACTIVE, WS_LISTENER_UPTIME,
+            WS_LISTENER_TOTAL_ACTIVE, WS_LISTENER_LAST_SEEN,
+        )
+        for m in (WS_LISTENER_ACTIVE, WS_LISTENER_UPTIME,
+                  WS_LISTENER_TOTAL_ACTIVE, WS_LISTENER_LAST_SEEN):
+            # prometheus_client metrics expose ._labelnames
+            self.assertIn('url', m._labelnames)
+        # smoke: setting with a url label works
+        WS_LISTENER_ACTIVE.labels(url='https://mevx.io/?chain=solana').set(1)
+        WS_LISTENER_UPTIME.labels(url='https://mevx.io/?chain=solana').set(123.0)
+        WS_LISTENER_TOTAL_ACTIVE.labels(url='https://mevx.io/?chain=solana').inc(123.0)
+        WS_LISTENER_LAST_SEEN.labels(url='https://mevx.io/?chain=solana').set(1700000000.0)
+
     def test_ws_metric_objects_defined(self):
         expected = {
             "WS_LISTENERS_ACTIVE": "flaresolverr_ws_listeners_active",

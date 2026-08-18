@@ -63,6 +63,30 @@ WS_SESSION_DURATION = Histogram(
     buckets=[60, 300, 600, 900, 1800, 3600, 7200, 14400]
 )
 
+WS_LISTENER_ACTIVE = Gauge(
+    name='flaresolverr_ws_listener_active',
+    documentation='1 if the URL has at least one running/starting listener, 0 otherwise',
+    labelnames=['url']
+)
+
+WS_LISTENER_UPTIME = Gauge(
+    name='flaresolverr_ws_listener_uptime_seconds',
+    documentation='Current active session duration in seconds for the URL primary listener',
+    labelnames=['url']
+)
+
+WS_LISTENER_TOTAL_ACTIVE = Counter(
+    name='flaresolverr_ws_listener_total_active_seconds',
+    documentation='Cumulative active listening time in seconds per URL',
+    labelnames=['url']
+)
+
+WS_LISTENER_LAST_SEEN = Gauge(
+    name='flaresolverr_ws_listener_last_seen_timestamp',
+    documentation='Unix timestamp of the last successful heartbeat for the URL listener',
+    labelnames=['url']
+)
+
 
 def serve(port):
     start_http_server(port=port)
