@@ -432,6 +432,18 @@ def test_browser_installation():
     logging.info("Launching web browser...")
     user_agent = utils.get_user_agent()
     logging.info("FlareSolverr User-Agent: " + user_agent)
+
+    # Test actual Chrome launch
+    try:
+        driver = utils.get_webdriver()
+        driver.get("data:text/html,<html>test</html>")
+        assert "test" in driver.page_source
+        driver.quit()
+        logging.info("Chrome launch test successful!")
+    except Exception as e:
+        logging.error(f"Chrome launch test failed: {e}")
+        sys.exit(1)
+
     logging.info("Test successful!")
 
 
