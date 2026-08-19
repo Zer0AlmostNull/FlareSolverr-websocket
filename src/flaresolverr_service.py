@@ -92,6 +92,23 @@ class WebSocketListener:
 
 # WEBSOCKET_MESSAGES: deque[WebsocketMessage] = deque(maxlen=500)
 
+def _live_user_data_dirs() -> set:
+    from flaresolverr import ws_listener_manager
+    dirs = set()
+    for session in SESSIONS_STORAGE.sessions.values():
+        d = getattr(session.driver, "_fs_user_data_dir", None)
+        if d:
+            dirs.add(d)
+    for listener in ws_listener_manager.listeners.values():
+        if listener.session_id:
+            session = SESSIONS_STORAGE.sessions.get(listener.session_id)
+            if session:
+                d = getattr(session.driver, "_fs_user_data_dir", None)
+                if d:
+                    dirs.add(d)
+    return dirs
+
+
 def _websocket_message_handler(session, event, log_level=logging.INFO, track_metrics: bool = True):
     params = event['params']
     frame_type = event['method'].split('.')[-1]  # "webSocketFrameReceived" or "webSocketFrameSent"
@@ -205,6 +222,7 @@ class WebSocketListenerManager:
                 SESSIONS_STORAGE.destroy(f"ws_listener_{listener.listener_id}")
             except Exception:
                 pass
+            utils.kill_orphaned_chrome(_live_user_data_dirs())
             self._update_gauges()
             raise
 
@@ -580,7 +598,11 @@ def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
 
             driver = session.driver
         else:
-            driver = utils.get_webdriver(req.proxy)
+            try:
+                driver = utils.get_webdriver(req.proxy)
+            except Exception as e:
+                utils.kill_orphaned_chrome(_live_user_data_dirs())
+                raise Exception('Error solving the challenge. ' + str(e).replace('\n', '\\n'))
             logging.debug('New instance of webdriver has been created to perform the request')
 
         # Enable CDP Network domain and listen for websocket frames

@@ -4,9 +4,12 @@ import signal
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import utils
+import flaresolverr_service
+import flaresolverr
 
 
 class TestKillChromeByUserDataDir(unittest.TestCase):
@@ -112,6 +115,143 @@ class TestGetWebDriverFailureReap(unittest.TestCase):
                 utils.get_webdriver()
             mkdtemp.assert_called_once_with(prefix=utils.FS_CHROME_PROFILE_PREFIX)
             kill.assert_called_once_with("/tmp/flaresolverr_test")
+
+
+def _make_mock_session(session_id="s1", user_data_dir="/tmp/flaresolverr_session"):
+    driver = SimpleNamespace(
+        _fs_user_data_dir=user_data_dir,
+        quit=lambda: None,
+        close=lambda: None,
+    )
+    return SimpleNamespace(
+        session_id=session_id,
+        driver=driver,
+    )
+
+
+class TestLiveUserDataDirs(unittest.TestCase):
+
+    def setUp(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+        flaresolverr.ws_listener_manager.listeners.clear()
+
+    def tearDown(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+        flaresolverr.ws_listener_manager.listeners.clear()
+
+    def test_collects_from_sessions_storage(self):
+        session = _make_mock_session("s1", "/tmp/flaresolverr_sess1")
+        flaresolverr_service.SESSIONS_STORAGE.sessions["s1"] = session
+
+        dirs = flaresolverr_service._live_user_data_dirs()
+
+        self.assertEqual(dirs, {"/tmp/flaresolverr_sess1"})
+
+    def test_collects_from_ws_listeners(self):
+        session = _make_mock_session("ws_listener_abc", "/tmp/flaresolverr_ws1")
+        flaresolverr_service.SESSIONS_STORAGE.sessions["ws_listener_abc"] = session
+        listener = flaresolverr_service.WebSocketListener(
+            listener_id="abc", session_id="ws_listener_abc", url="https://x.io")
+        flaresolverr.ws_listener_manager.listeners["abc"] = listener
+
+        dirs = flaresolverr_service._live_user_data_dirs()
+
+        self.assertEqual(dirs, {"/tmp/flaresolverr_ws1"})
+
+    def test_collects_from_both_sources(self):
+        session1 = _make_mock_session("s1", "/tmp/flaresolverr_sess1")
+        session2 = _make_mock_session("ws_listener_abc", "/tmp/flaresolverr_ws1")
+        flaresolverr_service.SESSIONS_STORAGE.sessions["s1"] = session1
+        flaresolverr_service.SESSIONS_STORAGE.sessions["ws_listener_abc"] = session2
+        listener = flaresolverr_service.WebSocketListener(
+            listener_id="abc", session_id="ws_listener_abc", url="https://x.io")
+        flaresolverr.ws_listener_manager.listeners["abc"] = listener
+
+        dirs = flaresolverr_service._live_user_data_dirs()
+
+        self.assertEqual(dirs, {"/tmp/flaresolverr_sess1", "/tmp/flaresolverr_ws1"})
+
+    def test_skips_sessions_without_driver_dir(self):
+        session = SimpleNamespace(
+            session_id="s1",
+            driver=SimpleNamespace(quit=lambda: None),
+        )
+        flaresolverr_service.SESSIONS_STORAGE.sessions["s1"] = session
+
+        dirs = flaresolverr_service._live_user_data_dirs()
+
+        self.assertEqual(dirs, set())
+
+    def test_skips_listeners_without_session_id(self):
+        listener = flaresolverr_service.WebSocketListener(
+            listener_id="abc", session_id="", url="https://x.io")
+        flaresolverr.ws_listener_manager.listeners["abc"] = listener
+
+        dirs = flaresolverr_service._live_user_data_dirs()
+
+        self.assertEqual(dirs, set())
+
+
+class TestRequestPathFailureCallsKillOrphaned(unittest.TestCase):
+
+    def test_calls_kill_orphaned_on_get_webdriver_failure(self):
+        with mock.patch("utils.get_webdriver", side_effect=Exception("launch failed")), \
+             mock.patch("utils.kill_orphaned_chrome") as kill_mock, \
+             mock.patch.object(flaresolverr_service, "_live_user_data_dirs", return_value={"/tmp/live1"}):
+            req = SimpleNamespace(proxy=None, session=None, maxTimeout=60000,
+                                  session_ttl_minutes=None, url="https://x.io",
+                                  method="GET", headers=None, postData=None,
+                                  returnRawHtml=None, download=None, disableMedia=None,
+                                  cookies=None, returnOnlyCookies=None, waitInSeconds=None,
+                                  returnScreenshot=None, tabs_till_verify=None)
+            with self.assertRaises(Exception) as cm:
+                flaresolverr_service._resolve_challenge(req, "GET")
+            kill_mock.assert_called_once_with({"/tmp/live1"})
+            self.assertIn("Error solving the challenge", str(cm.exception))
+
+
+class TestListenerFailureCallsKillOrphaned(unittest.TestCase):
+
+    def setUp(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+        flaresolverr.ws_listener_manager.listeners.clear()
+        self._orig_create = flaresolverr_service.SESSIONS_STORAGE.create
+        self._orig_destroy = flaresolverr_service.SESSIONS_STORAGE.destroy
+
+    def tearDown(self):
+        flaresolverr_service.SESSIONS_STORAGE.create = self._orig_create
+        flaresolverr_service.SESSIONS_STORAGE.destroy = self._orig_destroy
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+        flaresolverr.ws_listener_manager.listeners.clear()
+
+    def test_calls_kill_orphaned_on_create_session_failure(self):
+        with mock.patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                              side_effect=Exception("create failed")), \
+             mock.patch("utils.kill_orphaned_chrome") as kill_mock, \
+             mock.patch.object(flaresolverr_service, "_live_user_data_dirs", return_value={"/tmp/live2"}):
+
+            manager = flaresolverr_service.WebSocketListenerManager(max_listeners=2)
+            with self.assertRaises(Exception):
+                manager.create_listener("https://x.io")
+
+            kill_mock.assert_called_once_with({"/tmp/live2"})
+
+    def test_calls_kill_orphaned_on_driver_get_failure(self):
+        session = _make_mock_session("ws_listener_abc", "/tmp/flaresolverr_ws1")
+        with mock.patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                              return_value=(session, True)), \
+             mock.patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy") as mock_destroy, \
+             mock.patch("utils.kill_orphaned_chrome") as kill_mock, \
+             mock.patch.object(flaresolverr_service, "_live_user_data_dirs", return_value={"/tmp/live3"}), \
+             mock.patch("flaresolverr_service.func_timeout",
+                        side_effect=Exception("timeout")):
+
+            manager = flaresolverr_service.WebSocketListenerManager(max_listeners=2)
+            with self.assertRaises(Exception):
+                manager.create_listener("https://x.io")
+
+            kill_mock.assert_called_once_with({"/tmp/live3"})
+            mock_destroy.assert_called_once()
 
 
 if __name__ == "__main__":
