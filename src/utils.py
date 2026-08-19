@@ -300,7 +300,6 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     options.add_argument('--disable-crashpad-handler') # Remove crashpad processes
     options.add_argument('--js-flags=--max-old-space-size=1024')  # Increase V8 heap
 
-    options.add_argument('--js-flags=--max-old-space-size=512')
     options.add_argument('--memory-pressure-off')
     options.add_argument('--disable-features=IsolateOrigins,site-per-process,AudioServiceOutOfProcess')
     options.add_argument('--disable-site-isolation-trials')
