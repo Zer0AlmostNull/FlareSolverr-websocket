@@ -295,7 +295,6 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
 
     # NEW: Stability and PID reduction flags
     options.add_argument('--headless=chrome')          # Force legacy headless (prevents --headless=new)
-    options.add_argument('--single-process')           # Run all in one process (~90% PID reduction)
     options.add_argument('--disable-crash-reporter')   # Remove crashpad processes
     options.add_argument('--disable-crashpad-handler') # Remove crashpad processes
     options.add_argument('--js-flags=--max-old-space-size=1024')  # Increase V8 heap
