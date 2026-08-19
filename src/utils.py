@@ -269,6 +269,13 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     global PATCHED_DRIVER_PATH, USER_AGENT
     logging.debug('Launching web browser...')
 
+    # Pre-launch aggressive cleanup of orphaned Chrome processes
+    try:
+        live_dirs = set()
+        kill_orphaned_chrome(live_dirs, grace_seconds=10)
+    except Exception:
+        pass
+
     # undetected_chromedriver
     options = uc.ChromeOptions()
     options.add_argument('--no-sandbox')
