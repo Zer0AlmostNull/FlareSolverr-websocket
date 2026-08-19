@@ -115,6 +115,12 @@ def background_tasks_thread():
         except Exception as e:
             logging.error(f"Error during ws listener cleanup: {e}")
 
+        try:
+            live = flaresolverr_service._live_user_data_dirs()
+            utils.kill_orphaned_chrome(live)
+        except Exception as e:
+            logging.error(f"Error during orphaned chrome cleanup: {e}")
+
         time.sleep(SESSION_HEALTH_CHECK_INTERVAL)
 
 if __name__ == "__main__":

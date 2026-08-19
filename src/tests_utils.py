@@ -254,5 +254,31 @@ class TestListenerFailureCallsKillOrphaned(unittest.TestCase):
             mock_destroy.assert_called_once()
 
 
+class TestBackgroundTasksThreadWatchdog(unittest.TestCase):
+
+    def setUp(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+        flaresolverr.ws_listener_manager.listeners.clear()
+
+    def tearDown(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+        flaresolverr.ws_listener_manager.listeners.clear()
+
+    def test_watchdog_calls_kill_orphaned_with_live_dirs(self):
+        with mock.patch("utils.kill_orphaned_chrome") as kill_mock, \
+             mock.patch.object(flaresolverr_service, "_live_user_data_dirs", return_value={"/tmp/live_watchdog"}) as live_mock, \
+             mock.patch("flaresolverr.flaresolverr_service.SESSIONS_STORAGE.cleanup_stale_sessions"), \
+             mock.patch("flaresolverr.ws_listener_manager.cleanup_stale"), \
+             mock.patch("flaresolverr.time.sleep", side_effect=KeyboardInterrupt):
+
+            try:
+                flaresolverr.background_tasks_thread()
+            except KeyboardInterrupt:
+                pass
+
+            live_mock.assert_called_once()
+            kill_mock.assert_called_once_with({"/tmp/live_watchdog"})
+
+
 if __name__ == "__main__":
     unittest.main()
