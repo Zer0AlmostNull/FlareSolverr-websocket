@@ -292,6 +292,14 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     options.add_argument('--disk-cache-size=1')
     options.add_argument('--media-cache-size=1')
     options.add_argument('--renderer-process-limit=1')
+
+    # NEW: Stability and PID reduction flags
+    options.add_argument('--headless=chrome')          # Force legacy headless (prevents --headless=new)
+    options.add_argument('--single-process')           # Run all in one process (~90% PID reduction)
+    options.add_argument('--disable-crash-reporter')   # Remove crashpad processes
+    options.add_argument('--disable-crashpad-handler') # Remove crashpad processes
+    options.add_argument('--js-flags=--max-old-space-size=1024')  # Increase V8 heap
+
     options.add_argument('--js-flags=--max-old-space-size=512')
     options.add_argument('--memory-pressure-off')
     options.add_argument('--disable-features=IsolateOrigins,site-per-process,AudioServiceOutOfProcess')
