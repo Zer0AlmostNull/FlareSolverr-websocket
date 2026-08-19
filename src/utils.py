@@ -4,8 +4,11 @@ import os
 import platform
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 
 from selenium.webdriver.chrome.webdriver import WebDriver
@@ -18,6 +21,111 @@ CHROME_MAJOR_VERSION = None
 USER_AGENT = None
 XVFB_DISPLAY = None
 PATCHED_DRIVER_PATH = None
+
+FS_CHROME_PROFILE_PREFIX = "flaresolverr_"
+
+
+def _get_boot_time() -> float:
+    try:
+        import psutil
+        return psutil.boot_time()
+    except Exception:
+        pass
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime"):
+                    return float(line.strip().split()[1])
+    except Exception:
+        pass
+    return 0.0
+
+
+def _kill_chrome_by_user_data_dir(user_data_dir: str) -> None:
+    try:
+        subprocess.run(
+            ["pkill", "-f", f"--user-data-dir={user_data_dir}"],
+            check=False, timeout=10,
+        )
+    except Exception:
+        pass
+    try:
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _orphan_process_dirs() -> dict:
+    """Return mapping user_data_dir -> (age_seconds, [pids]) for chrome procs."""
+    result = {}
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except Exception:
+        return result
+    clk_tck = os.sysconf("SC_CLK_TCK")
+    boot_time = _get_boot_time()
+    for pid in pids:
+        try:
+            with open(os.path.join("/proc", pid, "cmdline"), "rb") as f:
+                data = f.read().decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        if "chrome" not in data and "chromium" not in data:
+            continue
+        args = [a for a in data.split("\x00") if a]
+        user_data_dir = None
+        for arg in args:
+            if arg.startswith("--user-data-dir="):
+                user_data_dir = arg.split("=", 1)[1]
+                break
+        if user_data_dir is None:
+            continue
+        try:
+            pid_int = int(pid)
+        except Exception:
+            continue
+        entries = result.setdefault(user_data_dir, [0.0, []])
+        entries[1].append(pid_int)
+        try:
+            with open(os.path.join("/proc", pid, "stat")) as f:
+                stat = f.read()
+            starttime_ticks = int(stat.split(")")[1].split()[19])
+            proc_boot_time = boot_time + starttime_ticks / clk_tck
+            entries[0] = max(entries[0], time.time() - proc_boot_time)
+        except Exception:
+            pass
+    return result
+
+
+def kill_orphaned_chrome(live_user_data_dirs: set, grace_seconds: int = 120) -> None:
+    try:
+        orphan_dirs = _orphan_process_dirs()
+    except Exception:
+        return
+    for user_data_dir, (age, pids) in orphan_dirs.items():
+        if user_data_dir in live_user_data_dirs:
+            continue
+        if age < grace_seconds:
+            continue
+        try:
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
+            if pids:
+                time.sleep(2)
+                for pid in pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def get_config_log_html() -> bool:
@@ -259,15 +367,21 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     # detect chrome path
     browser_executable_path = get_chrome_exe_path()
 
+    # give every browser a known profile dir so a failed launch can be reaped
+    user_data_dir = tempfile.mkdtemp(prefix=FS_CHROME_PROFILE_PREFIX)
+    options.add_argument(f"--user-data-dir={user_data_dir}")
+
     # downloads and patches the chromedriver
     # if we don't set driver_executable_path it downloads, patches, and deletes the driver each time
     try:
         driver = uc.Chrome(options=options, browser_executable_path=browser_executable_path,
                            driver_executable_path=driver_exe_path, version_main=version_main,
                            windows_headless=windows_headless, headless=get_config_headless(),
-                           enable_cdp_events=True)
+                           enable_cdp_events=True, user_data_dir=user_data_dir)
     except Exception as e:
         logging.error("Error starting Chrome: %s" % e)
+        # reap the partially-spawned Chromium so it cannot leak
+        _kill_chrome_by_user_data_dir(user_data_dir)
         # No point in continuing if we cannot retrieve the driver
         raise e
 
@@ -276,6 +390,8 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
         PATCHED_DRIVER_PATH = os.path.join(driver.patcher.data_path, driver.patcher.exe_name)
         if PATCHED_DRIVER_PATH != driver.patcher.executable_path:
             shutil.copy(driver.patcher.executable_path, PATCHED_DRIVER_PATH)
+
+    driver._fs_user_data_dir = user_data_dir
 
     # clean up proxy extension directory
     if proxy_extension_dir is not None:
