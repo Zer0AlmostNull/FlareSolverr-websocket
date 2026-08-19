@@ -38,25 +38,27 @@ def prometheus_plugin(callback):
             # skip management and healthcheck endpoints
             return
 
-        # Skip metrics for websocket logger session
+        # Parse the incoming request to access cmd/session/url
         try:
             req = V1RequestBase(request.json)
-            if req.session and req.session == "websocket_logger_session":
-                return
         except:
-            pass
+            req = None
+
+        # Skip metrics for websocket logger session
+        if req is not None and req.session and req.session == "websocket_logger_session":
+            return
 
         domain = "unknown"
         if res.solution and res.solution.url:
             domain = parse_domain_url(res.solution.url)
         else:
             # timeout error
-            req = V1RequestBase(request.json)
-            if req.url:
+            if req is not None and req.url:
                 domain = parse_domain_url(req.url)
 
         run_time = (res.endTimestamp - res.startTimestamp) / 1000
-        REQUEST_DURATION.labels(domain=domain).observe(run_time)
+        cmd = req.cmd if req is not None else "unknown"
+        REQUEST_DURATION.labels(domain=domain, cmd=cmd).observe(run_time)
 
         result = "unknown"
         if res.message == "Challenge solved!":
@@ -65,7 +67,7 @@ def prometheus_plugin(callback):
             result = "not_detected"
         elif res.message.startswith("Error"):
             result = "error"
-        REQUEST_COUNTER.labels(domain=domain, result=result).inc()
+        REQUEST_COUNTER.labels(domain=domain, result=result, cmd=cmd).inc()
 
     def parse_domain_url(url):
         parsed_url = urllib.parse.urlparse(url)

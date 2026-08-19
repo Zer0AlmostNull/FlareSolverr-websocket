@@ -6,12 +6,12 @@ import time
 REQUEST_COUNTER = Counter(
     name='flaresolverr_request',
     documentation='Total requests with result',
-    labelnames=['domain', 'result']
+    labelnames=['domain', 'result', 'cmd']
 )
 REQUEST_DURATION = Histogram(
     name='flaresolverr_request_duration',
     documentation='Request duration in seconds',
-    labelnames=['domain'],
+    labelnames=['domain', 'cmd'],
     buckets=[10, 30, 60, 120, 300, 600]
 )
 
