@@ -42,14 +42,22 @@ def _get_boot_time() -> float:
 
 
 def _kill_chrome_by_user_data_dir(user_data_dir: str) -> None:
+    """Kill Chrome processes using the specific user-data-dir."""
     try:
-        subprocess.run(
-            ["pkill", "-f", f"--user-data-dir={user_data_dir}"],
-            check=False, timeout=10,
-        )
-    except Exception:
-        pass
-    try:
+        orphan_dirs = _orphan_process_dirs()
+        if user_data_dir in orphan_dirs:
+            age, pids = orphan_dirs[user_data_dir]
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
+            time.sleep(2)
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
         shutil.rmtree(user_data_dir, ignore_errors=True)
     except Exception:
         pass
