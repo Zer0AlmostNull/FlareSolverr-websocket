@@ -14,7 +14,6 @@ import utils
 import metrics
 
 
-
 class TestWebsocketCapture(unittest.TestCase):
     def setUp(self):
         self.app = TestApp(flaresolverr.app)
@@ -399,6 +398,38 @@ class TestWebSocketMetrics(unittest.TestCase):
         self.assertEqual(
             metrics.WS_LISTENERS_TOTAL.labels(event="max_reached")._value.get(),
             max_before + 1)
+
+    def test_ws_listeners_running_metric_excludes_starting(self):
+        """Test that WS_LISTENERS_RUNNING only counts 'running' listeners, not 'starting'."""
+        from flaresolverr_service import WebSocketListenerManager, WebSocketListener
+        from metrics import WS_LISTENERS_RUNNING, WS_LISTENERS_ACTIVE
+        from datetime import datetime
+        
+        manager = WebSocketListenerManager(max_listeners=5)
+        
+        # Manually add listeners with different statuses (bypass browser startup)
+        listener1 = WebSocketListener(listener_id="1", url="http://example.com", status="starting")
+        listener2 = WebSocketListener(listener_id="2", url="http://example2.com", status="running")
+        listener3 = WebSocketListener(listener_id="3", url="http://example3.com", status="unhealthy")
+        listener4 = WebSocketListener(listener_id="4", url="http://example4.com", status="running")
+        
+        manager.listeners = {
+            "1": listener1, "2": listener2, "3": listener3, "4": listener4
+        }
+        manager._url_index = {
+            "http://example.com": "1",
+            "http://example2.com": "2",
+            "http://example3.com": "3",
+            "http://example4.com": "4"
+        }
+        
+        manager._update_gauges()
+        
+        # WS_LISTENERS_ACTIVE should be 4 (all listeners)
+        assert WS_LISTENERS_ACTIVE._value.get() == 4
+        
+        # WS_LISTENERS_RUNNING should be 2 (only "running" status)
+        assert WS_LISTENERS_RUNNING._value.get() == 2
 
 
 class TestMetricsModule(unittest.TestCase):

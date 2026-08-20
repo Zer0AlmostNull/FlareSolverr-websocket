@@ -32,6 +32,11 @@ WS_LISTENERS_ACTIVE = Gauge(
     documentation='Current number of active websocket listeners'
 )
 
+WS_LISTENERS_RUNNING = Gauge(
+    name='flaresolverr_ws_listeners_running',
+    documentation='Current number of RUNNING websocket listeners (excludes starting and unhealthy)'
+)
+
 WS_LISTENERS_STATUS = Gauge(
     name='flaresolverr_ws_listeners_status',
     documentation='Number of websocket listeners per status (starting, running, unhealthy)',

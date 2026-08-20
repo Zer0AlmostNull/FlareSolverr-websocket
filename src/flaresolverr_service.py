@@ -22,6 +22,7 @@ from selenium.webdriver.support.wait import WebDriverWait
 
 import utils
 from metrics import (
+    WS_LISTENERS_RUNNING,
     WS_LISTENERS_ACTIVE, WS_LISTENERS_STATUS, WS_LISTENERS_TOTAL,
     WS_RECONNECT_TOTAL, WS_MESSAGES_TOTAL, WS_SESSION_DURATION,
     WS_LISTENER_ACTIVE, WS_LISTENER_UPTIME, WS_LISTENER_TOTAL_ACTIVE, WS_LISTENER_LAST_SEEN,
@@ -304,6 +305,10 @@ class WebSocketListenerManager:
 
     def _update_gauges(self):
         WS_LISTENERS_ACTIVE.set(len(self.listeners))
+        # New: count only "running" status listeners
+        running_count = sum(1 for l in self.listeners.values() if l.status == "running")
+        WS_LISTENERS_RUNNING.set(running_count)
+        
         status_counts = {"starting": 0, "running": 0, "unhealthy": 0}
         for listener in list(self.listeners.values()):
             if listener.status in status_counts:
