@@ -336,10 +336,11 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     options.add_argument('--no-pings')
     options.add_argument('--password-store=basic')
     options.add_argument('--use-mock-keychain')
+    options.add_argument('--disable-gpu-sandbox')
     # attempt to fix Docker ARM32 build
     IS_ARMARCH = platform.machine().startswith(('arm', 'aarch'))
     if IS_ARMARCH:
-        options.add_argument('--disable-gpu-sandbox')
+        pass
     options.add_argument('--ignore-certificate-errors')
     options.add_argument('--ignore-ssl-errors')
     # Disable the breaking Local Network Access Checks popup.
