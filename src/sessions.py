@@ -22,6 +22,7 @@ class Session:
     websocket_messages: deque = field(default_factory=lambda: deque(maxlen=utils.get_config_websocket_max_messages()))
     last_known_url: str = ""
     url_cache_time: float = 0
+    target_url: str = ""
 
     def lifetime(self) -> timedelta:
         return datetime.now() - self.created_at
@@ -34,7 +35,7 @@ class SessionsStorage:
         self.sessions = {}
 
     def create(self, session_id: Optional[str] = None, proxy: Optional[dict] = None,
-               force_new: Optional[bool] = False) -> Tuple[Session, bool]:
+               force_new: Optional[bool] = False, target_url: str = "") -> Tuple[Session, bool]:
         """create creates new instance of WebDriver if necessary,
         assign defined (or newly generated) session_id to the instance
         and returns the session object. If a new session has been created
@@ -55,7 +56,7 @@ class SessionsStorage:
 
         driver = utils.get_webdriver(proxy)
         created_at = datetime.now()
-        session = Session(session_id, driver, created_at)
+        session = Session(session_id, driver, created_at, target_url=target_url)
 
         self.sessions[session_id] = session
 

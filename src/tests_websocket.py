@@ -125,6 +125,20 @@ class TestWebsocketCapture(unittest.TestCase):
         self.assertEqual(r2.json["messages"], [])
 
 
+    def test_session_create_accepts_target_url(self):
+        from sessions import SessionsStorage
+        storage = SessionsStorage()
+        fake_driver = SimpleNamespace(quit=lambda: None)
+        with patch("utils.get_webdriver", return_value=fake_driver):
+            session, fresh = storage.create(session_id="t1", target_url="https://example.io")
+        self.assertTrue(fresh)
+        self.assertEqual(session.target_url, "https://example.io")
+        # default remains "" for regular sessions
+        with patch("utils.get_webdriver", return_value=fake_driver):
+            session2, _ = storage.create(session_id="t2")
+        self.assertEqual(session2.target_url, "")
+
+
 def _make_mock_session(session_id="s1", maxlen=500):
     driver = SimpleNamespace(
         execute_cdp_cmd=lambda *a, **k: None,
