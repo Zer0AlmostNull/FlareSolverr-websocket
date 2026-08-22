@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+* Add `target_url` field to `Session` and `SessionsStorage.create()` so websocket listener sessions carry their target URL.
+* Fall back to the listener's `target_url` when CDP websocket events lack a URL, eliminating metrics recorded with an empty `url=""` label.
 * Add six `flaresolverr_ws_*` Prometheus metrics for WebSocket-listener stability (active listeners, per-status count, lifecycle events, reconnect outcomes, frames captured, session duration) and wire them into WebSocketListenerManager lifecycle.
 * Give every browser an explicit `--user-data-dir` (`flaresolverr_` prefix) and reap the partially-spawned Chromium via `pkill` + `rmtree` when `uc.Chrome` fails to launch, fixing the launch-failure memory leak. Add `kill_orphaned_chrome()` watchdog helper to reap stale orphaned profiles.
 
