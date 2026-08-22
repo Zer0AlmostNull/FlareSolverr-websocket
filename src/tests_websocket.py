@@ -49,6 +49,20 @@ class TestWebsocketCapture(unittest.TestCase):
         self.assertEqual((message.type, message.url, message.payload),
                          ("webSocketFrameReceived", "wss://socket.example", "hello"))
 
+    def test_message_handler_falls_back_to_target_url(self):
+        session = SimpleNamespace(
+            websocket_messages=deque(),
+            url_cache_time=9999999999,
+            last_known_url="",
+            target_url="https://listener.example",
+            driver=SimpleNamespace(current_url=""),
+        )
+        flaresolverr_service._websocket_message_handler(session, {
+            "method": "Network.webSocketFrameReceived",
+            "params": {"response": {"payloadData": "hi"}},  # no url in params
+        }, track_metrics=True)
+        self.assertEqual(session.websocket_messages[0].url, "https://listener.example")
+
     def test_config_getters_defaults(self):
         with patch.dict('os.environ', {}, clear=True):
             self.assertEqual(utils.get_config_max_ws_listeners(), 5)

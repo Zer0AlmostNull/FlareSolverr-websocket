@@ -124,7 +124,7 @@ def _websocket_message_handler(session, event, log_level=logging.INFO, track_met
         except Exception:
             pass
 
-    url = params.get('url', session.last_known_url) 
+    url = params.get('url') or getattr(session, 'target_url', '') or session.last_known_url
     payload = params['response']['payloadData'] if 'response' in params and 'payloadData' in params['response'] else \
               params.get('payloadData', '') # Fallback to empty string if not found
 
@@ -197,7 +197,8 @@ class WebSocketListenerManager:
 
     def _start_session(self, listener: WebSocketListener, url: str, max_messages: int):
         try:
-            session, _ = SESSIONS_STORAGE.create(session_id=f"ws_listener_{listener.listener_id}")
+            session, _ = SESSIONS_STORAGE.create(
+                session_id=f"ws_listener_{listener.listener_id}", target_url=url)
             session.websocket_messages = deque(maxlen=max_messages)
             _register_listener_cdp(session)
             create_timeout = utils.get_config_ws_listener_create_timeout()
