@@ -152,6 +152,11 @@ def background_tasks_thread():
             logging.error(f"Error during orphaned chrome cleanup: {e}")
 
         try:
+            utils.sweep_stale_profile_dirs(live)
+        except Exception as e:
+            logging.error(f"Error during profile dir sweep: {e}")
+
+        try:
             update_lifecycle_gauges()
         except Exception as e:
             logging.error(f"Error in lifecycle gauges: {e}")

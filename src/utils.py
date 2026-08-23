@@ -250,6 +250,52 @@ def kill_orphaned_chrome(live_user_data_dirs: set, grace_seconds: int = 120) -> 
             pass
 
 
+def sweep_stale_profile_dirs(live_user_data_dirs: set, max_age_seconds: int = None,
+                             scan_dir: str = None) -> int:
+    """Remove flaresolverr_* chromium profile dirs that have no running browser
+    process behind them and are older than max_age_seconds.
+    kill_orphaned_chrome only reaches dirs whose browser is STILL RUNNING;
+    dirs of already-dead drivers accumulated indefinitely (2200+ observed)."""
+    max_age = max_age_seconds or get_config_profile_dir_max_age()
+    base = scan_dir or tempfile.gettempdir()
+    cutoff = time.time() - max_age
+    removed = 0
+    try:
+        proc_owned = _orphan_process_dirs()
+    except Exception:
+        proc_owned = {}
+    try:
+        scandir_iter = os.scandir(base)
+    except Exception:
+        return 0
+    with scandir_iter:
+        for entry in scandir_iter:
+            try:
+                if not entry.is_dir():
+                    continue
+                name = entry.name
+                if not name.startswith(FS_CHROME_PROFILE_PREFIX):
+                    continue
+                full = entry.path
+                if full in live_user_data_dirs or name in live_user_data_dirs:
+                    continue
+                if full in proc_owned or name in proc_owned:
+                    continue
+                if entry.stat().st_mtime > cutoff:
+                    continue
+                shutil.rmtree(full, ignore_errors=True)
+                if not os.path.exists(full):
+                    removed += 1
+            except Exception:
+                logging.debug("profile sweep skipped %s", getattr(entry, 'path', '?'),
+                              exc_info=True)
+    return removed
+
+
+def get_config_profile_dir_max_age() -> int:
+    return int(os.environ.get('PROFILE_DIR_MAX_AGE_S', '600'))
+
+
 def get_config_log_html() -> bool:
     return os.environ.get('LOG_HTML', 'false').lower() == 'true'
 

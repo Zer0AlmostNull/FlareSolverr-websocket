@@ -106,6 +106,54 @@ class TestKillOrphanedChrome(unittest.TestCase):
             utils.kill_orphaned_chrome(set())
 
 
+class TestSweepStaleProfileDirs(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = os.path.join(self.tmp, 'flaresolverr_old')
+        self.young = os.path.join(self.tmp, 'flaresolverr_young')
+        for d in (self.old, self.young):
+            os.mkdir(d)
+        old_t = time.time() - 3600
+        os.utime(self.old, (old_t, old_t))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_removes_old_nonlive_dirs(self):
+        n = utils.sweep_stale_profile_dirs(set(), max_age_seconds=600, scan_dir=self.tmp)
+        self.assertGreaterEqual(n, 1)
+        self.assertFalse(os.path.exists(self.old))
+
+    def test_skips_young_dirs(self):
+        utils.sweep_stale_profile_dirs(set(), max_age_seconds=600, scan_dir=self.tmp)
+        self.assertTrue(os.path.exists(self.young))
+
+    def test_skips_live_dirs_even_old(self):
+        live = os.path.join(self.tmp, 'flaresolverr_live')
+        os.mkdir(live)
+        old_t = time.time() - 3600
+        os.utime(live, (old_t, old_t))
+        utils.sweep_stale_profile_dirs({live}, max_age_seconds=600, scan_dir=self.tmp)
+        self.assertTrue(os.path.exists(live))
+
+    def test_skips_dirs_with_running_chrome(self):
+        procdir = os.path.join(self.tmp, 'flaresolverr_procowned')
+        os.mkdir(procdir)
+        old_t = time.time() - 3600
+        os.utime(procdir, (old_t, old_t))
+        with mock.patch.object(utils, '_orphan_process_dirs',
+                               return_value={procdir: [999.0, [4242]]}):
+            utils.sweep_stale_profile_dirs(set(), max_age_seconds=600, scan_dir=self.tmp)
+        self.assertTrue(os.path.exists(procdir))
+
+    def test_config_getter_default_and_override(self):
+        with mock.patch.dict('os.environ', {}, clear=True):
+            self.assertEqual(utils.get_config_profile_dir_max_age(), 600)
+        with mock.patch.dict('os.environ', {'PROFILE_DIR_MAX_AGE_S': '300'}):
+            self.assertEqual(utils.get_config_profile_dir_max_age(), 300)
+
+
 class TestGetWebDriverFailureReap(unittest.TestCase):
 
     def test_kills_profile_on_launch_failure(self):
@@ -269,6 +317,7 @@ class TestBackgroundTasksThreadWatchdog(unittest.TestCase):
 
     def test_watchdog_calls_kill_orphaned_with_live_dirs(self):
         with mock.patch("utils.kill_orphaned_chrome") as kill_mock, \
+             mock.patch("utils.sweep_stale_profile_dirs"), \
              mock.patch.object(flaresolverr_service, "_live_user_data_dirs", return_value={"/tmp/live_watchdog"}) as live_mock, \
              mock.patch("flaresolverr.flaresolverr_service.SESSIONS_STORAGE.cleanup_stale_sessions"), \
              mock.patch("flaresolverr.ws_listener_manager.cleanup_stale"), \
