@@ -274,7 +274,9 @@ class WebSocketListenerManager:
         with self._lock:
             listener = self.listeners.get(listener_id)
             if listener is not None:
-                listener.last_heartbeat = datetime.now()
+                now = datetime.now()
+                listener.last_heartbeat = now
+                WS_LISTENER_LAST_SEEN.labels(url=listener.url).set(now.timestamp())
             return listener
 
     def _drain(self, listener_id: str):

@@ -282,6 +282,19 @@ class TestWebSocketListenerManager(unittest.TestCase):
         self.manager.get_listener(listener.listener_id)
         self.assertGreater(listener.last_heartbeat, old)
 
+    def test_get_listener_renews_exported_last_seen_gauge(self):
+        from metrics import WS_LISTENER_LAST_SEEN
+        url = 'https://heartbeat.io'
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          return_value=(_make_mock_session(), True)):
+            listener = self.manager.create_listener(url)
+        before = WS_LISTENER_LAST_SEEN.labels(url=url)._value.get()
+        time.sleep(1.1)  # ensure the epoch-second value advances
+        self.manager.get_listener(listener.listener_id)
+        after = WS_LISTENER_LAST_SEEN.labels(url=url)._value.get()
+        self.assertGreater(after, before)
+        self.assertAlmostEqual(after, time.time(), delta=5)
+
     def test_destroy_listener(self):
         session = _make_mock_session()
         with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
