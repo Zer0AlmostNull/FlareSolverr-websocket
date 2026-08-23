@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+* Bound selenium blocking at driver creation: every browser launched via `get_webdriver()` now gets a bounded HTTP command timeout (`DRIVER_COMMAND_TIMEOUT`, default 120s) on the urllib3 client-config (previously `None` in pinned selenium 4.39.0, so a hung chromedriver froze a thread forever), plus self-bounding page loads (`PAGE_LOAD_TIMEOUT`, default 75s < 90s listener-create bound) and script timeouts via new `_harden_driver_timeouts()`. Adds config getters `get_config_driver_command_timeout()`, `get_config_page_load_timeout()`, `get_config_shutdown_grace()` (default 10s, consumed by upcoming safe_quit work).
 * Add zero-drop listener recycling: listeners are proactively recycled after `WS_LISTENER_MAX_LIFETIME_MINUTES` (default 180 min) via spawn-first handover — a replacement browser is launched in parallel, ownership of the URL slot swaps atomically on success, and buffers are merged so no captured frames are dropped. Single-flight mutex prevents concurrent recycles of the same listener.
 * Tune Chromium flags for long-lived headless listeners and preserve frame buffers across reconnects; ownership-safe index pops prevent recycle threads from racing the manager.
 * Derive listener gauges (`WS_LISTENERS_ACTIVE`, `WS_LISTENERS_RUNNING`, `WS_LISTENERS_STATUS`) from primary (indexed) listeners only so recycle shadows are invisible to dashboards; per-URL metrics now iterate `_url_index` directly.

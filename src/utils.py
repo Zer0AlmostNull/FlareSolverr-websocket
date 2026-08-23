@@ -63,6 +63,30 @@ def _kill_chrome_by_user_data_dir(user_data_dir: str) -> None:
         pass
 
 
+def _harden_driver_timeouts(driver):
+    """Bound every layer of selenium blocking so a hung chromedriver raises
+    instead of freezing a thread forever. Order matters: the client-config
+    timeout is set FIRST because it bounds the page-load-timeout HTTP call
+    itself."""
+    # 1) Bound EVERY selenium HTTP command (urllib3 recv otherwise blocks forever)
+    cmd_timeout = get_config_driver_command_timeout()
+    executor = getattr(driver, 'command_executor', None)
+    client_config = getattr(executor, '_client_config', None)
+    if client_config is not None:
+        client_config.timeout = cmd_timeout
+    elif executor is not None and hasattr(executor, 'set_timeout'):
+        executor.set_timeout(cmd_timeout)
+    # 2) Make driver.get() self-bounding inside chrome/chromedriver
+    try:
+        driver.set_page_load_timeout(get_config_page_load_timeout())
+    except Exception as e:
+        logging.warning(f"set_page_load_timeout failed at launch: {e}")
+    try:
+        driver.set_script_timeout(30)
+    except Exception as e:
+        logging.warning(f"set_script_timeout failed at launch: {e}")
+
+
 def _orphan_process_dirs() -> dict:
     """Return mapping user_data_dir -> (age_seconds, [pids]) for chrome procs."""
     result = {}
@@ -170,6 +194,18 @@ def get_config_ws_listener_create_timeout() -> int:
 
 def get_config_ws_listener_max_lifetime() -> int:
     return int(os.environ.get('WS_LISTENER_MAX_LIFETIME_MINUTES', '180'))
+
+
+def get_config_driver_command_timeout() -> int:
+    return int(os.environ.get('DRIVER_COMMAND_TIMEOUT', '120'))
+
+
+def get_config_page_load_timeout() -> int:
+    return int(os.environ.get('PAGE_LOAD_TIMEOUT', '75'))
+
+
+def get_config_shutdown_grace() -> int:
+    return int(os.environ.get('SHUTDOWN_GRACE', '10'))
 
 
 def get_config_ws_chrome_v8_heap_mb() -> int:
@@ -422,6 +458,9 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
             shutil.copy(driver.patcher.executable_path, PATCHED_DRIVER_PATH)
 
     driver._fs_user_data_dir = user_data_dir
+
+    # Bound all selenium blocking layers (hang -> exception, not frozen thread)
+    _harden_driver_timeouts(driver)
 
     # clean up proxy extension directory
     if proxy_extension_dir is not None:

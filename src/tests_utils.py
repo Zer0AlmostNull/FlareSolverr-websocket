@@ -280,5 +280,39 @@ class TestBackgroundTasksThreadWatchdog(unittest.TestCase):
             kill_mock.assert_called_once_with({"/tmp/live_watchdog"})
 
 
+class TestDriverTimeoutHardening(unittest.TestCase):
+
+    def test_config_getters_defaults_and_overrides(self):
+        with mock.patch.dict('os.environ', {}, clear=True):
+            self.assertEqual(utils.get_config_driver_command_timeout(), 120)
+            self.assertEqual(utils.get_config_page_load_timeout(), 75)
+            self.assertEqual(utils.get_config_shutdown_grace(), 10)
+        with mock.patch.dict('os.environ', {'DRIVER_COMMAND_TIMEOUT': '60',
+                                            'PAGE_LOAD_TIMEOUT': '30',
+                                            'SHUTDOWN_GRACE': '5'}):
+            self.assertEqual(utils.get_config_driver_command_timeout(), 60)
+            self.assertEqual(utils.get_config_page_load_timeout(), 30)
+            self.assertEqual(utils.get_config_shutdown_grace(), 5)
+
+    def test_harden_driver_timeouts_sets_all_layers(self):
+        driver = mock.MagicMock()
+        cc = mock.MagicMock()
+        driver.command_executor = mock.MagicMock()
+        driver.command_executor._client_config = cc
+        utils._harden_driver_timeouts(driver)
+        self.assertEqual(cc.timeout, 120)
+        driver.set_page_load_timeout.assert_called_once_with(75)
+        driver.set_script_timeout.assert_called_once_with(30)
+
+    def test_harden_driver_falls_back_without_client_config(self):
+        executor = SimpleNamespace(set_timeout=mock.Mock())
+        driver = SimpleNamespace(command_executor=executor,
+                                 set_page_load_timeout=mock.Mock(),
+                                 set_script_timeout=mock.Mock())
+        utils._harden_driver_timeouts(driver)
+        executor.set_timeout.assert_called_once_with(120)
+        driver.set_page_load_timeout.assert_called_once_with(75)
+
+
 if __name__ == "__main__":
     unittest.main()
