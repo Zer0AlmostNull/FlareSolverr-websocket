@@ -50,6 +50,18 @@ class Reactor(threading.Thread):
             self.loop.run_until_complete(self.listen())
         except Exception as e:
             logger.warning("Reactor.run() => %s", e)
+        finally:
+            # Deterministic teardown: this thread owns the loop; never close
+            # cross-thread from quit(). bpo-41699 hazard class avoided.
+            for coro_name in ("shutdown_asyncgens", "shutdown_default_executor"):
+                try:
+                    self.loop.run_until_complete(getattr(self.loop, coro_name)())
+                except Exception:
+                    logger.debug("loop %s failed", coro_name, exc_info=True)
+            try:
+                self.loop.close()
+            except Exception:
+                pass
 
     async def _wait_service_started(self):
         while True:
@@ -79,18 +91,18 @@ class Reactor(threading.Thread):
                         message = obj.get("message")
                         method = message.get("method")
 
-                        if "*" in self.handlers:
-                            await self.loop.run_in_executor(
-                                None, self.handlers["*"], message
-                            )
-                        elif method.lower() in self.handlers:
-                            await self.loop.run_in_executor(
-                                None, self.handlers[method.lower()], message
-                            )
-
-                        # print(type(message), message)
+                        cb = self.handlers.get("*") or self.handlers.get(method.lower())
+                        if cb is not None:
+                            # Synchronous call: dispatch was already fully serial
+                            # (each await completed before the next entry), so the
+                            # executor added only a stranded-thread hazard. A
+                            # handler error must not abort the remaining batch.
+                            try:
+                                cb(message)
+                            except Exception as e:
+                                logger.debug("cdp handler error (%s): %s", method, e)
                     except Exception as e:
-                        raise e from None
+                        logging.debug("event dispatch error:", e)
 
             except Exception as e:
                 if "invalid session id" in str(e):

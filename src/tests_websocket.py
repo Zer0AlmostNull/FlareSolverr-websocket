@@ -1,10 +1,13 @@
+import inspect
+import json
 import os
+import threading
 import time
 import unittest
 from collections import deque
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from webtest import TestApp
 
@@ -12,6 +15,7 @@ import flaresolverr
 import flaresolverr_service
 import utils
 import metrics
+from undetected_chromedriver import reactor
 
 
 class TestWebsocketCapture(unittest.TestCase):
@@ -934,6 +938,69 @@ class TestRecycleMetricInvisibility(unittest.TestCase):
         new_sess = store[f"ws_listener_{new_lid}"]
         self.assertEqual([m.payload for m in new_sess.websocket_messages],
                          ["m0", "m1", "m2", "late"])
+
+
+class TestReactorHygiene(unittest.TestCase):
+
+    def _mk_reactor(self, handlers=None):
+        r = reactor.Reactor.__new__(reactor.Reactor)   # skip __init__ (no Chrome)
+        r.driver = SimpleNamespace(_delay=0)
+        r.loop = Mock()
+        r.loop.run_until_complete = Mock(return_value=None)
+        r.lock = threading.Lock()
+        r.event = threading.Event()
+        r.handlers = handlers or {}
+        return r
+
+    def test_handler_exception_does_not_abort_batch(self):
+        import asyncio as aio
+        called = []
+        outcomes = [RuntimeError("boom"), "ok"]
+        def flaky(msg):
+            o = outcomes.pop(0)
+            if isinstance(o, Exception):
+                raise o
+            called.append(msg)
+        r = self._mk_reactor(handlers={'*': flaky})
+        entries = [{'message': json.dumps({'message': {'method': 'M1'}})},
+                   {'message': json.dumps({'message': {'method': 'M2'}})}]
+        calls = {'n': 0}
+        def fake_get_log(name):
+            calls['n'] += 1
+            if calls['n'] >= 2:
+                r.event.set()
+            return entries
+        r.driver = SimpleNamespace(_delay=0, get_log=fake_get_log)
+        loop = aio.new_event_loop()
+        try:
+            loop.run_until_complete(aio.wait_for(r.listen(), timeout=5))
+        finally:
+            loop.close()
+        self.assertEqual(len(called), 1)   # M2 still delivered after M1 raised
+
+    def test_reactor_run_closes_loop_in_finally(self):
+        r = self._mk_reactor()
+        r.loop.run_until_complete.side_effect = RuntimeError("listen died")
+        with patch('asyncio.set_event_loop'):
+            r.run()   # must not raise
+        r.loop.shutdown_asyncgens.assert_called_once()
+        r.loop.shutdown_default_executor.assert_called_once()
+        r.loop.close.assert_called_once()
+
+    def test_dispatch_is_synchronous(self):
+        src = inspect.getsource(reactor.Reactor.listen)
+        self.assertNotIn('run_in_executor', src)
+
+
+class TestLifecycleGauges(unittest.TestCase):
+
+    def test_update_lifecycle_gauges_sets_values(self):
+        before = threading.active_count()
+        flaresolverr.update_lifecycle_gauges()
+        val = list(metrics.PROCESS_THREADS_ACTIVE.collect())[0].samples[0].value
+        self.assertGreaterEqual(val, before)
+        # series exist:
+        self.assertIsNotNone(list(metrics.GC_EVENT_LOOPS.collect())[0].samples)
 
 
 if __name__ == '__main__':

@@ -1,3 +1,5 @@
+import asyncio
+import gc
 import json
 import logging
 import os
@@ -6,6 +8,7 @@ import threading
 import time
 
 import certifi
+import undetected_chromedriver as uc
 from bottle import run, response, Bottle, request, ServerAdapter
 
 from bottle_plugins.error_plugin import error_plugin
@@ -13,6 +16,7 @@ from bottle_plugins.logger_plugin import logger_plugin
 from bottle_plugins import prometheus_plugin
 from dtos import V1RequestBase, HealthResponse, STATUS_OK # Added HealthResponse, STATUS_OK
 import flaresolverr_service
+import metrics
 import utils
 
 env_proxy_url = os.environ.get('PROXY_URL', None)
@@ -96,6 +100,25 @@ def get_websocket_messages():
     response.content_type = 'application/json'
     return json.dumps(payload)
 
+def update_lifecycle_gauges():
+    """Export thread/object-census gauges so thread-pool or driver accumulation
+    is visible in Prometheus instead of rediscovered via archaeology. O(heap)
+    census — safe at the background-sweep cadence, never per-request."""
+    try:
+        metrics.PROCESS_THREADS_ACTIVE.set(threading.active_count())
+        metrics.THREAD_POOL_WORKERS.set(sum(
+            1 for t in threading.enumerate()
+            if t.name.startswith('ThreadPoolExecutor-')))
+        metrics.GC_EVENT_LOOPS.set(sum(
+            1 for o in gc.get_objects()
+            if isinstance(o, asyncio.AbstractEventLoop)))
+        metrics.GC_CHROME_DRIVERS.set(sum(
+            1 for o in gc.get_objects()
+            if isinstance(o, uc.Chrome)))
+    except Exception as e:
+        logging.error(f"Error updating lifecycle gauges: {e}")
+
+
 def background_tasks_thread():
     last_cleanup = 0
     CLEANUP_INTERVAL = 600
@@ -120,6 +143,11 @@ def background_tasks_thread():
             utils.kill_orphaned_chrome(live)
         except Exception as e:
             logging.error(f"Error during orphaned chrome cleanup: {e}")
+
+        try:
+            update_lifecycle_gauges()
+        except Exception as e:
+            logging.error(f"Error in lifecycle gauges: {e}")
 
         time.sleep(SESSION_HEALTH_CHECK_INTERVAL)
 

@@ -779,17 +779,21 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
 
     def quit(self):
         try:
+            self.reactor.event.set()
+            logger.debug("shutting down reactor")
+            if getattr(self, "reactor", None) is not None and self.reactor.is_alive():
+                self.reactor.join(timeout=2.0)
+                if self.reactor.is_alive():
+                    logger.warning("reactor did not stop within 2s; abandoning")
+        except AttributeError:
+            pass
+        try:
             self.service.stop()
             self.service.process.kill()
             self.command_executor.close()
             self.service.process.wait(5)
             logger.debug("webdriver process ended")
         except (AttributeError, RuntimeError, OSError):
-            pass
-        try:
-            self.reactor.event.set()
-            logger.debug("shutting down reactor")
-        except AttributeError:
             pass
         try:
             os.kill(self.browser_pid, 15)

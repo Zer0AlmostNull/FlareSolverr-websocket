@@ -93,6 +93,26 @@ WS_LISTENER_LAST_SEEN = Gauge(
 )
 
 
+PROCESS_THREADS_ACTIVE = Gauge(
+    name='flaresolverr_process_threads_active',
+    documentation='Current number of active threads in the FlareSolverr process'
+)
+
+THREAD_POOL_WORKERS = Gauge(
+    name='flaresolverr_thread_pool_workers',
+    documentation='Threads belonging to ThreadPoolExecutor pools'
+)
+
+GC_EVENT_LOOPS = Gauge(
+    name='flaresolverr_gc_event_loops',
+    documentation='Live asyncio event loop objects (gc census)'
+)
+
+GC_CHROME_DRIVERS = Gauge(
+    name='flaresolverr_gc_chrome_drivers',
+    documentation='Live undetected_chromedriver Chrome instances (gc census)')
+
+
 def serve(port):
     start_http_server(port=port)
     while True:
