@@ -225,10 +225,7 @@ class WebSocketListenerManager:
             except Exception:
                 pass
             utils.kill_orphaned_chrome(_live_user_data_dirs())
-            # Force removal: kill_orphaned_chrome just tore down the browser for
-            # every session, so no listener for this URL is actually alive. The
-            # periodic health loop re-creates the series if one recovers.
-            self._release_url_metrics(url, force=True)
+            self._release_url_metrics(url)
             self._update_gauges()
             raise
 
@@ -339,14 +336,13 @@ class WebSocketListenerManager:
                 WS_LISTENER_UPTIME.labels(url=url).set(
                     (now - lst.created_at).total_seconds())
 
-    def _release_url_metrics(self, url: str, force: bool = False):
+    def _release_url_metrics(self, url: str):
         """Drop or refresh per-URL gauges after a listener serving `url` is gone."""
-        if not force:
-            with self._lock:
-                still_listened = any(l.url == url for l in self.listeners.values())
-            if still_listened:
-                self._update_per_url_metrics()
-                return
+        with self._lock:
+            still_listened = any(l.url == url for l in self.listeners.values())
+        if still_listened:
+            self._update_per_url_metrics()
+            return
         for gauge in (WS_LISTENER_ACTIVE, WS_LISTENER_UPTIME, WS_LISTENER_LAST_SEEN):
             try:
                 gauge.remove(url)

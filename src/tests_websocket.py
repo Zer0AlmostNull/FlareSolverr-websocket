@@ -365,24 +365,21 @@ class TestWebSocketListenerManager(unittest.TestCase):
                 self.manager.destroy_listener(l1.listener_id)
 
     def test_start_session_failure_clears_per_url_metrics(self):
-        from metrics import WS_LISTENER_ACTIVE, WS_LISTENER_LAST_SEEN
+        from metrics import WS_LISTENER_ACTIVE, WS_LISTENER_LAST_SEEN, WS_LISTENER_UPTIME
         url = 'https://fail-start.io'
-        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
-                          return_value=(_make_mock_session(), True)):
-            listener = self.manager.create_listener(url)
-        # now make session creation fail for the retry path
+        # seed the series for a url that has no live listener
+        WS_LISTENER_LAST_SEEN.labels(url=url).set(1700000000.0)
+        WS_LISTENER_ACTIVE.labels(url=url).set(1)
+        WS_LISTENER_UPTIME.labels(url=url).set(5.0)
         with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
                           side_effect=Exception("browser dead")):
             with patch.object(utils, "kill_orphaned_chrome", lambda *a: None):
                 with self.assertRaises(Exception):
                     self.manager.create_listener(url)
-        samples = [s for s in WS_LISTENER_ACTIVE.collect()[0].samples
-                   if s.labels.get('url') == url]
-        self.assertEqual(
-            [s for s in WS_LISTENER_LAST_SEEN.collect()[0].samples
-             if s.labels.get('url') == url], [])
-        # active series removed too
-        self.assertEqual([s for s in samples], [])
+        samples = lambda g: [s for s in g.collect()[0].samples if s.labels.get('url') == url]
+        self.assertEqual(samples(WS_LISTENER_LAST_SEEN), [])
+        self.assertEqual(samples(WS_LISTENER_ACTIVE), [])
+        self.assertEqual(samples(WS_LISTENER_UPTIME), [])
 
 
 class TestWebSocketListenerEndpoints(unittest.TestCase):
