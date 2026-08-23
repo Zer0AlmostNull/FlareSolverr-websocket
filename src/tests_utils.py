@@ -346,7 +346,7 @@ class TestSafeQuit(unittest.TestCase):
             start = time.monotonic()
             utils.safe_quit(driver)
             elapsed = time.monotonic() - start
-        self.assertLess(elapsed, 10)          # did NOT wait 30s
+        self.assertLess(elapsed, 8)           # grace + 2*grace worst case
         esc.assert_called_once_with(driver, '/tmp/fs_test_profile')
 
     def test_bounded_shutdown_thread_abandoned_after_grace(self):
@@ -358,6 +358,32 @@ class TestSafeQuit(unittest.TestCase):
              patch.dict('os.environ', {'SHUTDOWN_GRACE': '1'}):
             utils.safe_quit(driver)
         slow.assert_called_once()             # ran bounded, not forever
+
+    def test_escalation_not_armed_during_shutdown_phase(self):
+        driver = self._mk_driver()
+        order = []
+        entered = threading.Event()
+
+        class TrackingTimer(threading.Timer):
+            def start(self):
+                order.append('timer_started')
+                super().start()
+
+        def slow_shutdown():
+            entered.set()
+            time.sleep(30)
+
+        driver.service.send_remote_shutdown_command = MagicMock(side_effect=slow_shutdown)
+        with patch.object(utils.threading, 'Timer', TrackingTimer), \
+             patch.object(utils, '_escalate_kill'), \
+             patch.dict('os.environ', {'SHUTDOWN_GRACE': '5'}):
+            t = threading.Thread(target=utils.safe_quit, args=(driver,), daemon=True)
+            t.start()
+            self.assertTrue(entered.wait(5))
+            time.sleep(0.3)                    # mid-shutdown-phase sample
+            self.assertNotIn('timer_started', order)
+            t.join(15)
+        self.assertIn('timer_started', order)  # armed once quit phase began
 
     def test_escalate_kill_terms_then_kills_and_sweeps(self):
         driver = self._mk_driver()

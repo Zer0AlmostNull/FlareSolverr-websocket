@@ -93,9 +93,9 @@ def safe_quit(driver, grace=None):
     chromedriver therefore wedged destroy() indefinitely, leaking the entire
     process tree. Here: (a) the chromedriver shutdown-command is run on a
     daemon thread we abandon after `grace` seconds; (b) driver.quit() runs on
-    a daemon thread abandoned after grace*2; (c) an escalation timer
-    force-kills pids and sweeps the profile if quit() hasn't returned within
-    grace*2."""
+    a daemon thread abandoned after grace*2; (c) an escalation timer armed only
+    once the quit phase begins force-kills pids and sweeps the profile if
+    quit() hasn't returned within grace*2 of THAT point."""
     grace = grace or get_config_shutdown_grace()
     service = getattr(driver, 'service', None)
     orig_shutdown = getattr(service, 'send_remote_shutdown_command', None)
@@ -111,9 +111,6 @@ def safe_quit(driver, grace=None):
         except Exception:
             logging.debug("could not bound send_remote_shutdown_command", exc_info=True)
     udd = getattr(driver, '_fs_user_data_dir', None)
-    killer = threading.Timer(grace * 2, _escalate_kill, args=(driver, udd))
-    killer.daemon = True
-    killer.start()
     outcome = {}
 
     def do_quit():
@@ -122,19 +119,24 @@ def safe_quit(driver, grace=None):
         except BaseException as e:
             outcome['error'] = e
 
+    killer = None
     try:
         if callable(orig_shutdown):
             try:
                 bounded_shutdown()
             except Exception:
                 logging.debug("bounded shutdown-command failed", exc_info=True)
+        killer = threading.Timer(grace * 2, _escalate_kill, args=(driver, udd))
+        killer.daemon = True
+        killer.start()
         quitter = threading.Thread(target=do_quit, daemon=True)
         quitter.start()
         quitter.join(grace * 2)
         if 'error' in outcome:
             raise outcome['error']
     finally:
-        killer.cancel()
+        if killer is not None:
+            killer.cancel()
 
 
 def _harden_driver_timeouts(driver):
