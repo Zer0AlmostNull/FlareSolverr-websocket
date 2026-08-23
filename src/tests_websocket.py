@@ -663,5 +663,125 @@ class TestListenerCorrectnessFixes(unittest.TestCase):
         self.assertEqual(lst.status, "running")
 
 
+class TestListenerRecycle(unittest.TestCase):
+
+    def setUp(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+
+    def tearDown(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+
+    def _install_primary(self, mgr, url, lid, msgs=(), age_minutes=0):
+        lst = flaresolverr_service.WebSocketListener(
+            listener_id=lid, url=url, status="running")
+        lst.session_id = f"ws_listener_{lid}"
+        if age_minutes:
+            lst.created_at = datetime.now() - timedelta(minutes=age_minutes)
+        sess = _make_mock_session()
+        sess.websocket_messages = deque(msgs, maxlen=500)
+        flaresolverr_service.SESSIONS_STORAGE.sessions[lst.session_id] = sess
+        mgr.listeners[lid] = lst
+        mgr._url_index[url] = lid
+        return lst
+
+    def _fake_create(self, store, prefix="new"):
+        state = {"n": 0}
+
+        def fake(session_id=None, target_url="", **kw):
+            state["n"] += 1
+            s = _make_mock_session()
+            s.session_id = session_id
+            s.target_url = target_url
+            store[session_id] = s
+            return s, True
+        return fake, state
+
+    def test_recycle_zero_message_loss_and_atomic_swap(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        msgs = [flaresolverr_service.WebsocketMessage(
+                    timestamp=float(i), type="webSocketFrameReceived",
+                    url="http://x", payload=f"m{i}") for i in range(3)]
+        old = self._install_primary(mgr, "http://x", "old1", msgs)
+        store = flaresolverr_service.SESSIONS_STORAGE.sessions
+        fake, state = self._fake_create(store)
+
+        def fake_get(url_arg):
+            pass  # instant page load
+
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=fake), \
+             patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
+                          return_value=True) as m_destroy, \
+             patch("flaresolverr_service._register_listener_cdp"), \
+             patch("flaresolverr_service.func_timeout", side_effect=lambda t, f, a: f(*a)):
+            mgr._recycle_listener(old)
+
+        new_lid = mgr._url_index["http://x"]
+        self.assertNotEqual(new_lid, "old1")
+        self.assertNotIn("old1", mgr.listeners)
+        self.assertIn(new_lid, mgr.listeners)
+        new_lst = mgr.listeners[new_lid]
+        self.assertEqual(new_lst.status, "running")
+        # zero message loss: all three survived into the new session
+        new_sess = store[f"ws_listener_{new_lid}"]
+        self.assertEqual([m.payload for m in new_sess.websocket_messages],
+                         ["m0", "m1", "m2"])
+        # old session was retired last
+        m_destroy.assert_called_once_with("ws_listener_old1")
+        # service continuity anchor copied
+        self.assertIsNotNone(new_lst.service_started_at)
+        self.assertEqual(new_lst.service_started_at, old.created_at)
+
+    def test_recycle_boot_failure_keeps_original(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        old = self._install_primary(mgr, "http://x", "old1")
+        store = flaresolverr_service.SESSIONS_STORAGE.sessions
+
+        def failing_create(session_id=None, target_url="", **kw):
+            raise Exception("chrome exploded")
+
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=failing_create), \
+             patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
+                          return_value=True), \
+             patch.object(flaresolverr_service.utils, "kill_orphaned_chrome"):
+            mgr._recycle_listener(old)
+        # original untouched and still primary
+        self.assertEqual(mgr._url_index["http://x"], "old1")
+        self.assertIn("old1", mgr.listeners)
+        self.assertEqual(old.status, "running")
+
+    def test_recycle_single_flight(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        self.assertTrue(mgr._recycle_lock.acquire(blocking=False))
+        old = self._install_primary(mgr, "http://x", "old1")
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create") as m_create:
+            mgr._recycle_listener(old)
+            m_create.assert_not_called()
+        self.assertIn("old1", mgr.listeners)
+
+    def test_cleanup_stale_triggers_recycle_for_old_primary_only(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        self._install_primary(mgr, "http://x", "young", age_minutes=10)
+        old = self._install_primary(mgr, "http://y", "aged", age_minutes=200)
+        with patch.object(mgr, "_recycle_listener") as m_recycle:
+            mgr.cleanup_stale()
+        m_recycle.assert_called_once()
+        self.assertIs(m_recycle.call_args[0][0], old)
+
+    def test_shadow_skipped_by_cleanup(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        shadow = flaresolverr_service.WebSocketListener(
+            listener_id="sh1", url="http://x", status="starting", replacing=True)
+        shadow.session_id = "ws_listener_sh1"
+        shadow.created_at = datetime.now() - timedelta(hours=99)
+        mgr.listeners["sh1"] = shadow   # deliberately NOT indexed
+        with patch.object(mgr, "_recycle_listener") as m_recycle, \
+             patch.object(mgr, "destroy_listener") as m_destroy:
+            mgr.cleanup_stale()
+        m_recycle.assert_not_called()
+        m_destroy.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
