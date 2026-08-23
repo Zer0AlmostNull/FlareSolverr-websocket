@@ -325,13 +325,15 @@ class WebSocketListenerManager:
         return self._locked_get(listener_id)
 
     def _update_gauges(self):
-        WS_LISTENERS_ACTIVE.set(len(self.listeners))
-        # New: count only "running" status listeners
-        running_count = sum(1 for l in self.listeners.values() if l.status == "running")
+        # Count PRIMARY listeners only (indexed ones). Recycle shadows are
+        # transient and must be invisible to dashboards.
+        primaries = [self.listeners[lid] for lid in self._url_index.values()
+                     if lid in self.listeners]
+        WS_LISTENERS_ACTIVE.set(len(primaries))
+        running_count = sum(1 for l in primaries if l.status == "running")
         WS_LISTENERS_RUNNING.set(running_count)
-        
         status_counts = {"starting": 0, "running": 0, "unhealthy": 0}
-        for listener in list(self.listeners.values()):
+        for listener in primaries:
             if listener.status in status_counts:
                 status_counts[listener.status] += 1
         for status, count in status_counts.items():
@@ -339,19 +341,17 @@ class WebSocketListenerManager:
 
     def _update_per_url_metrics(self):
         now = datetime.now()
-        # group listeners by url
-        by_url: dict[str, WebSocketListener] = {}
-        for lst in list(self.listeners.values()):
-            # keep the most recently created listener per url as "primary"
-            if lst.url not in by_url or lst.created_at > by_url[lst.url].created_at:
-                by_url[lst.url] = lst
-        for url, lst in by_url.items():
+        for url, lid in list(self._url_index.items()):
+            lst = self.listeners.get(lid)
+            if lst is None:
+                continue
             is_active = lst.status in ("running", "starting")
             WS_LISTENER_ACTIVE.labels(url=url).set(1 if is_active else 0)
             WS_LISTENER_LAST_SEEN.labels(url=url).set(now.timestamp())
             if is_active:
+                anchor = lst.service_started_at or lst.created_at
                 WS_LISTENER_UPTIME.labels(url=url).set(
-                    (now - lst.created_at).total_seconds())
+                    (now - anchor).total_seconds())
 
     def _release_url_metrics(self, url: str):
         """Drop or refresh per-URL gauges after a listener serving `url` is gone."""
@@ -476,13 +476,15 @@ class WebSocketListenerManager:
                 self._url_index[url] = new_listener.listener_id
             # Final re-drain under lock: any frames that landed in the old
             # session's buffer after the merge above must not be dropped.
+            # Append (not prepend) so these post-swap frames stay AFTER the
+            # already-merged older frames — FIFO order preserved.
             with self._lock:
                 old_session = SESSIONS_STORAGE.sessions.get(old_listener.session_id)
                 new_session = SESSIONS_STORAGE.sessions.get(new_listener.session_id)
                 if old_session is not None and new_session is not None:
                     remaining = list(old_session.websocket_messages)
                     old_session.websocket_messages.clear()
-                    new_session.websocket_messages.extendleft(reversed(remaining))
+                    new_session.websocket_messages.extend(remaining)
             # Retire old AFTER the swap, off the lock.
             self.retire_listener(old_listener.listener_id)
             logging.info(f"Recycled listener for {url}: "

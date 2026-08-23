@@ -826,5 +826,98 @@ class TestListenerRecycle(unittest.TestCase):
         m_destroy.assert_not_called()
 
 
+class TestRecycleMetricInvisibility(unittest.TestCase):
+
+    def setUp(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+
+    def tearDown(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+
+    def _gauge_val(self, gauge, labels=None):
+        val = list(gauge.collect())[0].samples
+        for s in val:
+            if all(s.labels[k] == v for k, v in (labels or {}).items()):
+                return s.value
+        return None
+
+    def test_gauges_exclude_shadow_during_overlap(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        primary = flaresolverr_service.WebSocketListener(
+            listener_id="p1", url="http://x", status="running")
+        mgr.listeners["p1"] = primary
+        mgr._url_index["http://x"] = "p1"
+        shadow = flaresolverr_service.WebSocketListener(
+            listener_id="s1", url="http://x", status="starting", replacing=True)
+        mgr.listeners["s1"] = shadow   # exists during boot, NOT indexed
+        mgr._update_gauges()
+        self.assertEqual(self._gauge_val(metrics.WS_LISTENERS_ACTIVE), 1.0)
+        self.assertEqual(self._gauge_val(metrics.WS_LISTENERS_RUNNING), 1.0)
+        self.assertEqual(
+            self._gauge_val(metrics.WS_LISTENERS_STATUS, {"status": "starting"}),
+            0.0)
+
+    def test_uptime_uses_service_started_at(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        lst = flaresolverr_service.WebSocketListener(
+            listener_id="p1", url="http://x", status="running")
+        lst.created_at = datetime.now()          # fresh browser...
+        lst.service_started_at = datetime.now() - timedelta(hours=5)  # ...long service
+        mgr.listeners["p1"] = lst
+        mgr._url_index["http://x"] = "p1"
+        mgr._update_per_url_metrics()
+        uptime = self._gauge_val(metrics.WS_LISTENER_UPTIME, {"url": "http://x"})
+        self.assertGreater(uptime, 17000)  # ~5h in seconds
+
+    def test_final_redrain_preserves_fifo_order(self):
+        """Frames landing between the swap merge and the final re-drain must be
+        appended AFTER already-merged frames (FIFO), not prepended."""
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        msgs = [flaresolverr_service.WebsocketMessage(
+                    timestamp=float(i), type="webSocketFrameReceived",
+                    url="http://x", payload=f"m{i}") for i in range(3)]
+        old = flaresolverr_service.WebSocketListener(
+            listener_id="old1", url="http://x", status="running")
+        old.session_id = "ws_listener_old1"
+        sess = _make_mock_session()
+
+        fired = {"n": 0}
+
+        class HookedDeque(deque):
+            def clear(self_inner):
+                super(HookedDeque, self_inner).clear()
+                if fired["n"] == 0:  # fire once: after the main swap merge
+                    fired["n"] += 1
+                    self_inner.append(flaresolverr_service.WebsocketMessage(
+                        timestamp=99.0, type="webSocketFrameReceived",
+                        url="http://x", payload="late"))
+
+        sess.websocket_messages = HookedDeque(msgs, maxlen=500)
+        flaresolverr_service.SESSIONS_STORAGE.sessions[old.session_id] = sess
+        mgr.listeners["old1"] = old
+        mgr._url_index["http://x"] = "old1"
+        store = flaresolverr_service.SESSIONS_STORAGE.sessions
+
+        def fake(session_id=None, target_url="", **kw):
+            s = _make_mock_session()
+            s.session_id = session_id
+            store[session_id] = s
+            return s, True
+
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=fake), \
+             patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
+                          return_value=True), \
+             patch("flaresolverr_service._register_listener_cdp"), \
+             patch("flaresolverr_service.func_timeout",
+                   side_effect=lambda t, f, a: f(*a)):
+            mgr._recycle_listener(old)
+
+        new_lid = mgr._url_index["http://x"]
+        new_sess = store[f"ws_listener_{new_lid}"]
+        self.assertEqual([m.payload for m in new_sess.websocket_messages],
+                         ["m0", "m1", "m2", "late"])
+
+
 if __name__ == '__main__':
     unittest.main()

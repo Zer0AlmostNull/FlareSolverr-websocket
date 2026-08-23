@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+* Derive listener gauges (`WS_LISTENERS_ACTIVE`, `WS_LISTENERS_RUNNING`, `WS_LISTENERS_STATUS`) from primary (indexed) listeners only so recycle shadows are invisible to dashboards; per-URL metrics now iterate `_url_index` directly.
+* Anchor `WS_LISTENER_UPTIME` at `service_started_at` (falling back to `created_at`) so uptime survives recycles.
+* Fix FIFO ordering of frames re-drained during the final pre-retire merge in `_recycle_listener` (append instead of prepend).
 * Add `target_url` field to `Session` and `SessionsStorage.create()` so websocket listener sessions carry their target URL.
 * Fall back to the listener's `target_url` when CDP websocket events lack a URL, eliminating metrics recorded with an empty `url=""` label.
 * Add six `flaresolverr_ws_*` Prometheus metrics for WebSocket-listener stability (active listeners, per-status count, lifecycle events, reconnect outcomes, frames captured, session duration) and wire them into WebSocketListenerManager lifecycle.
