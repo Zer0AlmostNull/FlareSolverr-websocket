@@ -75,6 +75,12 @@ class TestWebsocketCapture(unittest.TestCase):
         with patch.dict('os.environ', {'WS_LISTENER_MAX_LIFETIME_MINUTES': '360'}):
             self.assertEqual(utils.get_config_ws_listener_max_lifetime(), 360)
 
+    def test_ws_chrome_v8_heap_mb_default_and_env(self):
+        with patch.dict('os.environ', {}, clear=True):
+            self.assertEqual(utils.get_config_ws_chrome_v8_heap_mb(), 1024)
+        with patch.dict('os.environ', {'WS_CHROME_V8_HEAP_MB': '512'}):
+            self.assertEqual(utils.get_config_ws_chrome_v8_heap_mb(), 512)
+
     def test_websocket_listener_dataclass_defaults(self):
         now = datetime.now()
         listener = flaresolverr_service.WebSocketListener(
@@ -649,7 +655,7 @@ class TestListenerCorrectnessFixes(unittest.TestCase):
         payloads = [m.payload for m in new_session.websocket_messages]
         self.assertEqual(payloads, ["keepme"])
         # destroy called BEFORE create (same-session-id recreation)
-        self.assertLess(m_destroy.call_count, 99)  # did not raise
+        self.assertGreaterEqual(m_destroy.call_count, 1)  # did not raise
         self.assertEqual(captured["target_url"], "http://x")
 
     def test_reconnect_attempts_reset_on_recovery(self):
@@ -811,6 +817,17 @@ class TestListenerRecycle(unittest.TestCase):
             mgr.cleanup_stale()
         m_recycle.assert_called_once()
         self.assertIs(m_recycle.call_args[0][0], old)
+
+    def test_max_lifetime_zero_disables_recycle(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        self._install_primary(mgr, "http://x", "old1", age_minutes=200)
+        with patch.dict('os.environ', {'WS_LISTENER_MAX_LIFETIME_MINUTES': '0'}), \
+             patch.object(mgr, "_recycle_listener") as m_recycle:
+            mgr.cleanup_stale()
+        m_recycle.assert_not_called()
+        # listener still alive and primary
+        self.assertEqual(mgr._url_index.get("http://x"), "old1")
+        self.assertIn("old1", mgr.listeners)
 
     def test_shadow_skipped_by_cleanup(self):
         mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)

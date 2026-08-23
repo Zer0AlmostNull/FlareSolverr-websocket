@@ -172,6 +172,10 @@ def get_config_ws_listener_max_lifetime() -> int:
     return int(os.environ.get('WS_LISTENER_MAX_LIFETIME_MINUTES', '180'))
 
 
+def get_config_ws_chrome_v8_heap_mb() -> int:
+    return int(os.environ.get('WS_CHROME_V8_HEAP_MB', '1024'))
+
+
 def get_flaresolverr_version() -> str:
     global FLARESOLVERR_VERSION
     if FLARESOLVERR_VERSION is not None:
@@ -301,7 +305,8 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     options.add_argument('--headless=chrome')          # Force legacy headless (prevents --headless=new)
     options.add_argument('--disable-crash-reporter')   # Remove crashpad processes
     options.add_argument('--disable-crashpad-handler') # Remove crashpad processes
-    options.add_argument('--js-flags=--max-old-space-size=512')  # Bound V8 heap
+    options.add_argument('--js-flags=--max-old-space-size=%d'
+                         % get_config_ws_chrome_v8_heap_mb())  # Bound V8 heap
 
     options.add_argument('--disable-features=IsolateOrigins,site-per-process,AudioServiceOutOfProcess')
     options.add_argument('--disable-site-isolation-trials')

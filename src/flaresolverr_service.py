@@ -160,8 +160,11 @@ class WebSocketListenerManager:
         self.listeners: dict[str, WebSocketListener] = {}
         self.max_listeners = max_listeners
         self._url_index: dict[str, str] = {}
-        self._lock = threading.Lock()
+        # RLock: gauge methods take the lock themselves but some callers
+        # already hold it when invoking them.
+        self._lock = threading.RLock()
         self._recycle_lock = threading.Lock()  # single-flight recycle guard
+        self._recycle_cooldown_until: dict[str, datetime] = {}
 
     def _get_session(self, listener: WebSocketListener):
         return SESSIONS_STORAGE.sessions.get(listener.session_id)
@@ -174,7 +177,8 @@ class WebSocketListenerManager:
         if self._url_index.get(url) != listener_id:
             return
         fallback = next(
-            (lid for lid, l in self.listeners.items() if l.url == url), None)
+            (lid for lid, l in self.listeners.items()
+             if l.url == url and not l.replacing and l.status != "failed"), None)
         if fallback is not None:
             self._url_index[url] = fallback
         else:
@@ -319,7 +323,15 @@ class WebSocketListenerManager:
 
     def ensure_and_fetch(self, url: str):
         listener = self.ensure_listener_for_url(url)
-        return self.get_listener_payload(listener.listener_id)
+        payload = self.get_listener_payload(listener.listener_id)
+        if payload is None:
+            # Listener was recycled/retired between resolve and drain;
+            # re-resolve the current primary once.
+            with self._lock:
+                lid = self._url_index.get(url)
+            if lid is not None:
+                payload = self.get_listener_payload(lid)
+        return payload
 
     def get_listener(self, listener_id: str) -> WebSocketListener | None:
         return self._locked_get(listener_id)
@@ -327,8 +339,9 @@ class WebSocketListenerManager:
     def _update_gauges(self):
         # Count PRIMARY listeners only (indexed ones). Recycle shadows are
         # transient and must be invisible to dashboards.
-        primaries = [self.listeners[lid] for lid in self._url_index.values()
-                     if lid in self.listeners]
+        with self._lock:
+            primaries = [self.listeners[lid] for lid in self._url_index.values()
+                         if lid in self.listeners]
         WS_LISTENERS_ACTIVE.set(len(primaries))
         running_count = sum(1 for l in primaries if l.status == "running")
         WS_LISTENERS_RUNNING.set(running_count)
@@ -340,18 +353,19 @@ class WebSocketListenerManager:
             WS_LISTENERS_STATUS.labels(status=status).set(count)
 
     def _update_per_url_metrics(self):
-        now = datetime.now()
-        for url, lid in list(self._url_index.items()):
-            lst = self.listeners.get(lid)
-            if lst is None:
-                continue
-            is_active = lst.status in ("running", "starting")
-            WS_LISTENER_ACTIVE.labels(url=url).set(1 if is_active else 0)
-            WS_LISTENER_LAST_SEEN.labels(url=url).set(now.timestamp())
-            if is_active:
-                anchor = lst.service_started_at or lst.created_at
-                WS_LISTENER_UPTIME.labels(url=url).set(
-                    (now - anchor).total_seconds())
+        with self._lock:
+            now = datetime.now()
+            for url, lid in list(self._url_index.items()):
+                lst = self.listeners.get(lid)
+                if lst is None:
+                    continue
+                is_active = lst.status in ("running", "starting")
+                WS_LISTENER_ACTIVE.labels(url=url).set(1 if is_active else 0)
+                WS_LISTENER_LAST_SEEN.labels(url=url).set(now.timestamp())
+                if is_active:
+                    anchor = lst.service_started_at or lst.created_at
+                    WS_LISTENER_UPTIME.labels(url=url).set(
+                        (now - anchor).total_seconds())
 
     def _release_url_metrics(self, url: str):
         """Drop or refresh per-URL gauges after a listener serving `url` is gone."""
@@ -391,7 +405,7 @@ class WebSocketListenerManager:
         self._update_gauges()
         return True
 
-    def retire_listener(self, listener_id: str) -> bool:
+    def retire_listener(self, listener_id: str, event: str = "destroyed") -> bool:
         """Pop a listener and tear down its session WITHOUT touching _url_index.
         Used by the recycler after the index already points at the successor."""
         with self._lock:
@@ -403,7 +417,7 @@ class WebSocketListenerManager:
             SESSIONS_STORAGE.destroy(session_id)
         except Exception as e:
             logging.warning(f"Error destroying session for listener {listener_id}: {e}")
-        WS_LISTENERS_TOTAL.labels(event="destroyed").inc()
+        WS_LISTENERS_TOTAL.labels(event=event).inc()
         WS_SESSION_DURATION.labels(url=listener.url).observe(
             (datetime.now() - listener.created_at).total_seconds())
         WS_LISTENER_TOTAL_ACTIVE.labels(url=listener.url).inc(
@@ -439,6 +453,19 @@ class WebSocketListenerManager:
         self._start_session(listener, url, listener.max_messages)
         return listener
 
+    @staticmethod
+    def _trim_backlog(remaining: list, new_session) -> list:
+        """Trim the OLD backlog so merging can never evict the new session's
+        freshest frames from its bounded deque (old frames yield; frames
+        captured by the new browser are newer and must survive)."""
+        capacity = ((new_session.websocket_messages.maxlen or 0)
+                    - len(new_session.websocket_messages))
+        if capacity <= 0:
+            return []
+        if len(remaining) > capacity:
+            return remaining[-capacity:]  # keep the newest old frames
+        return remaining
+
     def _recycle_listener(self, old_listener: WebSocketListener):
         """Zero-drop recycle: boot replacement FIRST (old keeps capturing),
         then atomically merge buffers + swap _url_index + retire old."""
@@ -454,12 +481,19 @@ class WebSocketListenerManager:
                     logging.info(f"Listener {old_listener.listener_id} already "
                                  f"retired; skipping stale recycle.")
                     return
-            url = old_listener.url
+                url = old_listener.url
+                now = datetime.now()
+                if now < self._recycle_cooldown_until.get(url, datetime.min):
+                    logging.info(f"Recycle for {url} in post-failure "
+                                 f"cooldown; skipping.")
+                    return
             try:
                 new_listener = self._spawn_replacement(old_listener)
             except Exception as e:
                 logging.error(f"Recycle of {old_listener.listener_id} failed; "
                               f"keeping original: {e}")
+                self._recycle_cooldown_until[url] = now + timedelta(minutes=10)
+                WS_LISTENERS_TOTAL.labels(event="recycle_failed").inc()
                 return
             with self._lock:
                 old_session = SESSIONS_STORAGE.sessions.get(old_listener.session_id)
@@ -467,6 +501,7 @@ class WebSocketListenerManager:
                 if old_session is not None and new_session is not None:
                     remaining = list(old_session.websocket_messages)
                     old_session.websocket_messages.clear()
+                    remaining = self._trim_backlog(remaining, new_session)
                     new_session.websocket_messages.extendleft(reversed(remaining))
                 new_listener.service_started_at = (
                         old_listener.service_started_at or old_listener.created_at)
@@ -484,9 +519,11 @@ class WebSocketListenerManager:
                 if old_session is not None and new_session is not None:
                     remaining = list(old_session.websocket_messages)
                     old_session.websocket_messages.clear()
+                    remaining = self._trim_backlog(remaining, new_session)
                     new_session.websocket_messages.extend(remaining)
             # Retire old AFTER the swap, off the lock.
-            self.retire_listener(old_listener.listener_id)
+            self.retire_listener(old_listener.listener_id, event="recycled")
+            self._recycle_cooldown_until.pop(url, None)
             logging.info(f"Recycled listener for {url}: "
                          f"{old_listener.listener_id} -> {new_listener.listener_id}")
         finally:
