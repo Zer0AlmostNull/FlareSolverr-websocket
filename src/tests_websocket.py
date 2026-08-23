@@ -565,5 +565,103 @@ class TestMetricsModule(unittest.TestCase):
             self.assertIn(metric_name, registered, f"metric {metric_name} not registered")
 
 
+class TestListenerCorrectnessFixes(unittest.TestCase):
+    """Ownership-safe _url_index pops + zero-loss reconnect."""
+
+    def setUp(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+
+    def tearDown(self):
+        flaresolverr_service.SESSIONS_STORAGE.sessions.clear()
+
+    def _mk_listener(self, mgr, url, lid):
+        lst = flaresolverr_service.WebSocketListener(listener_id=lid, url=url,
+                                                     status="running")
+        lst.session_id = f"ws_listener_{lid}"
+        mgr.listeners[lid] = lst
+        mgr._url_index[url] = lid
+        return lst
+
+    def test_destroy_shadow_keeps_primary_index(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        primary = self._mk_listener(mgr, "http://x", "p1")
+        shadow = self._mk_listener(mgr, "http://x", "s1")
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
+                          return_value=True):
+            mgr.destroy_listener("s1")
+        self.assertEqual(mgr._url_index.get("http://x"), "p1")
+        self.assertIn("p1", mgr.listeners)
+        self.assertNotIn("s1", mgr.listeners)
+
+    def test_destroy_primary_clears_its_own_index(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        primary = self._mk_listener(mgr, "http://x", "p1")
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
+                          return_value=True):
+            mgr.destroy_listener("p1")
+        self.assertNotIn("http://x", mgr._url_index)
+
+    def test_start_failure_keeps_primary_index(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        self._mk_listener(mgr, "http://x", "p1")
+        shadow = flaresolverr_service.WebSocketListener(
+            listener_id="s1", url="http://x", status="starting")
+        mgr.listeners["s1"] = shadow   # NOTE: shadow NOT indexed yet
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=Exception("boom")), \
+             patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
+                          return_value=True), \
+             patch.object(flaresolverr_service.utils, "kill_orphaned_chrome"):
+            with self.assertRaises(Exception):
+                mgr._start_session(shadow, "http://x", 500)
+        self.assertEqual(mgr._url_index.get("http://x"), "p1")
+        self.assertNotIn("s1", mgr.listeners)
+
+    def test_reconnect_preserves_buffered_messages(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        lst = self._mk_listener(mgr, "http://x", "p1")
+        old_session = _make_mock_session()
+        old_session.websocket_messages.append(
+            flaresolverr_service.WebsocketMessage(
+                timestamp=1.0, type="webSocketFrameReceived",
+                url="http://x", payload="keepme"))
+        flaresolverr_service.SESSIONS_STORAGE.sessions["ws_listener_p1"] = old_session
+
+        captured = {}
+
+        def fake_create(session_id=None, target_url="", **kw):
+            captured["session_id"] = session_id
+            captured["target_url"] = target_url
+            new_session = _make_mock_session()
+            new_session.session_id = session_id
+            flaresolverr_service.SESSIONS_STORAGE.sessions[session_id] = new_session
+            return new_session, True
+
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=fake_create), \
+             patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
+                          return_value=True) as m_destroy, \
+             patch("flaresolverr_service._register_listener_cdp"), \
+             patch("flaresolverr_service.func_timeout") as m_ft:
+            mgr._reconnect_listener(lst)
+        # old buffer content survived into the recreated session
+        new_session = flaresolverr_service.SESSIONS_STORAGE.sessions["ws_listener_p1"]
+        payloads = [m.payload for m in new_session.websocket_messages]
+        self.assertEqual(payloads, ["keepme"])
+        # destroy called BEFORE create (same-session-id recreation)
+        self.assertLess(m_destroy.call_count, 99)  # did not raise
+        self.assertEqual(captured["target_url"], "http://x")
+
+    def test_reconnect_attempts_reset_on_recovery(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        lst = self._mk_listener(mgr, "http://x", "p1")
+        lst.reconnect_attempts = 3
+        session = _make_mock_session()
+        flaresolverr_service.SESSIONS_STORAGE.sessions["ws_listener_p1"] = session
+        mgr.cleanup_stale()   # healthy probe -> recovery branch
+        self.assertEqual(lst.reconnect_attempts, 0)
+        self.assertEqual(lst.status, "running")
+
+
 if __name__ == '__main__':
     unittest.main()

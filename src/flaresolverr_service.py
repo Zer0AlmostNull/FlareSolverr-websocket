@@ -163,6 +163,20 @@ class WebSocketListenerManager:
     def _get_session(self, listener: WebSocketListener):
         return SESSIONS_STORAGE.sessions.get(listener.session_id)
 
+    def _pop_url_index(self, url: str, listener_id: str):
+        """Remove the index entry ONLY if it belongs to this listener.
+        If this listener owned the entry but another live listener still
+        serves the URL, re-point the index to it instead of clearing.
+        Must be called while holding self._lock."""
+        if self._url_index.get(url) != listener_id:
+            return
+        fallback = next(
+            (lid for lid, l in self.listeners.items() if l.url == url), None)
+        if fallback is not None:
+            self._url_index[url] = fallback
+        else:
+            del self._url_index[url]
+
     def create_listener(self, url: str, ttl_minutes: int = None,
                         max_messages: int = None) -> WebSocketListener:
         if not url:
@@ -217,7 +231,7 @@ class WebSocketListenerManager:
             logging.error(f"Failed to start WS listener {listener.listener_id} for {url}: {e}")
             with self._lock:
                 self.listeners.pop(listener.listener_id, None)
-                self._url_index.pop(url, None)
+                self._pop_url_index(url, listener.listener_id)
                 listener.status = "failed"
                 listener.error_message = str(e)
             try:
@@ -360,7 +374,7 @@ class WebSocketListenerManager:
             listener = self.listeners.pop(listener_id, None)
             if listener is None:
                 return False
-            self._url_index.pop(listener.url, None)
+            self._pop_url_index(listener.url, listener_id)
         try:
             SESSIONS_STORAGE.destroy(listener.session_id)
         except Exception as e:
@@ -398,6 +412,7 @@ class WebSocketListenerManager:
                 if listener.status != "running":
                     listener.status = "running"
                     listener.error_message = ""
+                listener.reconnect_attempts = 0
             except Exception as e:
                 listener.status = "unhealthy"
                 listener.error_message = str(e)
@@ -413,14 +428,25 @@ class WebSocketListenerManager:
     def _reconnect_listener(self, listener: WebSocketListener):
         listener.reconnect_attempts += 1
         try:
+            # Preserve buffered-but-unpolled messages across the crash.
+            old_session = SESSIONS_STORAGE.sessions.get(listener.session_id)
+            preserved = list(old_session.websocket_messages) if old_session else []
             SESSIONS_STORAGE.destroy(listener.session_id)
-            session, _ = SESSIONS_STORAGE.create(session_id=listener.session_id)
-            session.websocket_messages = deque(maxlen=listener.max_messages)
+            session, _ = SESSIONS_STORAGE.create(
+                session_id=listener.session_id, target_url=listener.url)
+            session.websocket_messages = deque(
+                preserved, maxlen=listener.max_messages)
             _register_listener_cdp(session)
-            session.driver.get(listener.url)
+            create_timeout = utils.get_config_ws_listener_create_timeout()
+            try:
+                func_timeout(create_timeout, session.driver.get, (listener.url,))
+            except FunctionTimedOut:
+                raise Exception(
+                    f"Timed out loading {listener.url} after {create_timeout}s")
             if listener.listener_id in self.listeners:
                 listener.status = "running"
                 listener.error_message = ""
+                listener.reconnect_attempts = 0
                 WS_RECONNECT_TOTAL.labels(url=listener.url, result="success").inc()
             else:
                 SESSIONS_STORAGE.destroy(listener.session_id)
