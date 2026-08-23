@@ -71,6 +71,9 @@ def _escalate_kill(driver, user_data_dir):
     service = getattr(driver, 'service', None)
     proc = getattr(service, 'process', None)
     pids = [getattr(proc, 'pid', None), getattr(driver, 'browser_pid', None)]
+    logging.warning(
+        "safe_quit escalation: killing chromedriver pid=%s browser_pid=%s profile=%s",
+        pids[0], pids[1], user_data_dir)
     for sig in (signal.SIGTERM, signal.SIGKILL):
         for pid in pids:
             if isinstance(pid, int) and pid > 0:
@@ -120,6 +123,7 @@ def safe_quit(driver, grace=None):
             outcome['error'] = e
 
     killer = None
+    quitter = None
     try:
         if callable(orig_shutdown):
             try:
@@ -132,10 +136,20 @@ def safe_quit(driver, grace=None):
         quitter = threading.Thread(target=do_quit, daemon=True)
         quitter.start()
         quitter.join(grace * 2)
+        if quitter.is_alive():
+            # quit() is STILL wedged past its deadline: leave the escalation
+            # timer armed. Cancelling here would race the Timer's own deadline
+            # (both are grace*2) and a cancelled escalation silently leaks the
+            # hung chromedriver process tree.
+            logging.warning(
+                "driver.quit() did not return within %ss; escalation performed/armed",
+                grace * 2)
         if 'error' in outcome:
             raise outcome['error']
     finally:
-        if killer is not None:
+        # Cancel only when quit actually finished (normally or raised-and-done);
+        # if the worker is still alive the escalation must be allowed to fire.
+        if killer is not None and (quitter is None or not quitter.is_alive()):
             killer.cancel()
 
 

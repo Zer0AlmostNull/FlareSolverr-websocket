@@ -115,6 +115,13 @@ def update_lifecycle_gauges():
         metrics.GC_CHROME_DRIVERS.set(sum(
             1 for o in gc.get_objects()
             if isinstance(o, uc.Chrome)))
+        try:
+            with open('/proc/self/statm') as f:
+                rss_pages = int(f.read().split()[1])
+            metrics.PROCESS_RSS_BYTES.set(rss_pages * os.sysconf('SC_PAGE_SIZE'))
+        except Exception:
+            # Non-Linux or restricted /proc: report 0 rather than skipping the sample
+            metrics.PROCESS_RSS_BYTES.set(0)
     except Exception as e:
         logging.error(f"Error updating lifecycle gauges: {e}")
 

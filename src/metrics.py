@@ -112,6 +112,10 @@ GC_CHROME_DRIVERS = Gauge(
     name='flaresolverr_gc_chrome_drivers',
     documentation='Live undetected_chromedriver Chrome instances (gc census)')
 
+PROCESS_RSS_BYTES = Gauge(
+    name='flaresolverr_process_rss_bytes',
+    documentation='Resident memory of the FlareSolverr process (from /proc/self/statm; 0 when unavailable)')
+
 
 def serve(port):
     start_http_server(port=port)

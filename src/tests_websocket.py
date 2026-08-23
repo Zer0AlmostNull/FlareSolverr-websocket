@@ -995,12 +995,30 @@ class TestReactorHygiene(unittest.TestCase):
 class TestLifecycleGauges(unittest.TestCase):
 
     def test_update_lifecycle_gauges_sets_values(self):
-        before = threading.active_count()
-        flaresolverr.update_lifecycle_gauges()
-        val = list(metrics.PROCESS_THREADS_ACTIVE.collect())[0].samples[0].value
-        self.assertGreaterEqual(val, before)
-        # series exist:
-        self.assertIsNotNone(list(metrics.GC_EVENT_LOOPS.collect())[0].samples)
+        import asyncio as aio
+        worker = threading.Thread(target=lambda: time.sleep(1),
+                                  name='ThreadPoolExecutor-0_worker')
+        worker.start()
+        loop_holder = aio.new_event_loop()   # held alive for the whole call
+        try:
+            flaresolverr.update_lifecycle_gauges()
+            threads_val = list(metrics.PROCESS_THREADS_ACTIVE.collect())[0].samples[0].value
+            self.assertGreaterEqual(threads_val, 1)
+            workers_val = list(metrics.THREAD_POOL_WORKERS.collect())[0].samples[0].value
+            self.assertGreaterEqual(workers_val, 1)
+            loops_val = list(metrics.GC_EVENT_LOOPS.collect())[0].samples[0].value
+            self.assertGreaterEqual(loops_val, 1)
+        finally:
+            loop_holder.close()
+            worker.join(5)
+        # GC_CHROME_DRIVERS: gauge series present (no real Chrome constructible here)
+        chrome_samples = list(metrics.GC_CHROME_DRIVERS.collect())[0].samples
+        self.assertGreater(len(chrome_samples), 0)
+        self.assertGreaterEqual(chrome_samples[0].value, 0)
+        # PROCESS_RSS_BYTES: series present, non-negative
+        rss_samples = list(metrics.PROCESS_RSS_BYTES.collect())[0].samples
+        self.assertGreater(len(rss_samples), 0)
+        self.assertGreaterEqual(rss_samples[0].value, 0)
 
 
 if __name__ == '__main__':

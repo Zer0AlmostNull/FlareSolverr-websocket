@@ -113,5 +113,9 @@ class SessionsStorage:
                 session_ids_to_destroy.append(session_id)
         
         for session_id in session_ids_to_destroy:
-            self.destroy(session_id)
+            try:
+                self.destroy(session_id)
+            except Exception as e:
+                logging.warning(
+                    f"Failed to destroy stale session {session_id}: {e}")
         logging.debug(f"Cleaned up {len(session_ids_to_destroy)} stale sessions.")

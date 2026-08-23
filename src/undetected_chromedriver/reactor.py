@@ -102,10 +102,10 @@ class Reactor(threading.Thread):
                             except Exception as e:
                                 logger.debug("cdp handler error (%s): %s", method, e)
                     except Exception as e:
-                        logging.debug("event dispatch error:", e)
+                        logger.debug("event dispatch error: %s", e)
 
             except Exception as e:
                 if "invalid session id" in str(e):
                     pass
                 else:
-                    logging.debug("exception ignored :", e)
+                    logger.debug("exception ignored: %s", e)
