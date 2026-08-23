@@ -15,6 +15,7 @@ import flaresolverr
 import flaresolverr_service
 import utils
 import metrics
+import undetected_chromedriver as uc_init
 from undetected_chromedriver import reactor
 
 
@@ -1019,6 +1020,48 @@ class TestLifecycleGauges(unittest.TestCase):
         rss_samples = list(metrics.PROCESS_RSS_BYTES.collect())[0].samples
         self.assertGreater(len(rss_samples), 0)
         self.assertGreaterEqual(rss_samples[0].value, 0)
+
+
+class TestChromeRetention(unittest.TestCase):
+
+    def test_finalize_pin_removed_and_registration_moved_to_end(self):
+        init_src = inspect.getsource(uc_init.Chrome.__init__)
+        self.assertNotIn('finalize(self,', init_src)
+        self.assertIn('LIVE_CHROMES.add(self)', init_src)
+        # registration must come AFTER self.options assignment (hash dependency)
+        self.assertGreater(init_src.index('LIVE_CHROMES.add(self)'),
+                           init_src.index('self.options'))
+
+    def test_quit_discards_from_live_chromes(self):
+        qsrc = inspect.getsource(uc_init.Chrome.quit)
+        self.assertIn('LIVE_CHROMES.discard(self)', qsrc)
+
+    def test_kill_unquit_chromes_calls_ensure_close(self):
+        # NOTE: SimpleNamespace lacks __weakref__ on CPython 3.14, so a
+        # WeakSet.add(fake) would raise TypeError; use a plain class fake.
+        class FakeChrome:
+            pass
+
+        fake = FakeChrome()
+        fake._ensure_close = Mock()
+        uc_init.LIVE_CHROMES.add(fake)
+        try:
+            uc_init._kill_unquit_chromes()
+            fake._ensure_close.assert_called_once_with(fake)
+        finally:
+            uc_init.LIVE_CHROMES.discard(fake)
+
+    def test_kill_unquit_chromes_swallows_errors(self):
+        class FakeChrome:
+            pass
+
+        fake = FakeChrome()
+        fake._ensure_close = Mock(side_effect=RuntimeError("x"))
+        uc_init.LIVE_CHROMES.add(fake)
+        try:
+            uc_init._kill_unquit_chromes()   # must not raise
+        finally:
+            uc_init.LIVE_CHROMES.discard(fake)
 
 
 if __name__ == '__main__':

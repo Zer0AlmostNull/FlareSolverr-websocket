@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+* Fix Chrome-object retention leak: replace `finalize(self, self._ensure_close, self)` in `Chrome.__init__` (whose `weakref.finalize._registry` args tuple held `self` STRONGLY, pinning every driver for process lifetime) with a module-level `LIVE_CHROMES: weakref.WeakSet` registered as the last statement of `__init__` plus an `atexit` killer `_kill_unquit_chromes()` that force-kills un-quit chromedrivers at interpreter exit. `quit()` now discards itself from the set (best-effort) and gains idempotency via a `_quitted` sentinel (also neutralizes the post-fix `__del__`-driven second quit whose stale-pid `os.kill(browser_pid)` could hit a recycled pid); browser_pid is nulled at end of quit.
 * Fix safe_quit escalation-vs-cancel race: if `driver.quit()` is still alive past grace*2, log a WARNING ("escalation performed/armed") and leave the escalation Timer uncancelled — cancelling unconditionally raced the Timer's own (grace*2) deadline, so a wedged chromedriver could silently leak. Exception propagation semantics unchanged.
 * `cleanup_stale_sessions` now isolates per-session destroy failures with try/except + warning so one poisoned session cannot abort the remaining sweep.
 * `_escalate_kill` logs a WARNING at entry (`safe_quit escalation: killing chromedriver pid=... browser_pid=... profile=...`).

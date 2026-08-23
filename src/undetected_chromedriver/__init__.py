@@ -29,6 +29,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import atexit
+import weakref
 from weakref import finalize
 
 import selenium.webdriver.chrome.service
@@ -59,6 +61,24 @@ __all__ = (
 
 logger = logging.getLogger("uc")
 logger.setLevel(logging.getLogger().getEffectiveLevel())
+
+# Weakly track every constructed Chrome so un-quit drivers get their
+# chromedriver force-killed at interpreter exit. Replaces the old
+# `finalize(self, self._ensure_close, self)` registration whose _registry
+# args tuple held `self` STRONGLY, pinning every driver for process lifetime
+# (upstream bug: UC #1270, PR #1258).
+LIVE_CHROMES = weakref.WeakSet()
+
+
+def _kill_unquit_chromes():
+    for chrome in list(LIVE_CHROMES):
+        try:
+            chrome._ensure_close(chrome)
+        except Exception:
+            logger.debug("atexit chromedriver kill failed", exc_info=True)
+
+
+atexit.register(_kill_unquit_chromes)
 
 
 class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
@@ -247,7 +267,6 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
 
         """
 
-        finalize(self, self._ensure_close, self)
         self.debug = debug
         self.patcher = Patcher(
             executable_path=driver_executable_path,
@@ -495,6 +514,10 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
 
         if headless or getattr(options, 'headless', None):
             self._configure_headless()
+
+        # Must stay LAST: WeakSet.add hashes self -> options.debugger_address,
+        # which does not exist until initialization completes.
+        LIVE_CHROMES.add(self)
 
     def _configure_headless(self):
         orig_get = self.get
@@ -778,6 +801,9 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
                 yield elem
 
     def quit(self):
+        if getattr(self, "_quitted", False):
+            return
+        self._quitted = True
         try:
             self.reactor.event.set()
             logger.debug("shutting down reactor")
@@ -827,6 +853,16 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
         # dereference patcher, so patcher can start cleaning up as well.
         # this must come last, otherwise it will throw 'in use' errors
         self.patcher = None
+
+        try:
+            self.browser_pid = None
+        except Exception:
+            pass
+
+        try:
+            LIVE_CHROMES.discard(self)
+        except Exception:
+            pass
 
     def __getattribute__(self, item):
         if not super().__getattribute__("debug"):
