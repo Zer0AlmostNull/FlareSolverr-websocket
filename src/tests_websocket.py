@@ -311,8 +311,65 @@ class TestWebSocketListenerManager(unittest.TestCase):
         finally:
             with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy", return_value=True):
                 mgr.destroy_listener(listener.listener_id)
-        # after destroy active goes to 0
-        self.assertEqual(WS_LISTENER_ACTIVE.labels(url=url)._value.get(), 0)
+        # after destroy the per-url series is removed entirely
+        samples = [s for s in WS_LISTENER_ACTIVE.collect()[0].samples
+                   if s.labels.get('url') == url]
+        self.assertEqual(samples, [])
+
+    def test_destroy_removes_last_seen_series_instead_of_zeroing(self):
+        from metrics import WS_LISTENER_ACTIVE, WS_LISTENER_LAST_SEEN, WS_LISTENER_UPTIME
+        url = 'https://zero-test.io'
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          return_value=(_make_mock_session(), True)):
+            listener = self.manager.create_listener(url)
+        # seed the series so we can observe removal
+        WS_LISTENER_LAST_SEEN.labels(url=url).set(1700000000.0)
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy", return_value=True):
+            self.manager.destroy_listener(listener.listener_id)
+        samples = lambda g: [s for s in g.collect()[0].samples if s.labels.get('url') == url]
+        self.assertEqual(samples(WS_LISTENER_LAST_SEEN), [])
+        self.assertEqual(samples(WS_LISTENER_ACTIVE), [])
+        self.assertEqual(samples(WS_LISTENER_UPTIME), [])
+
+    def test_destroy_keeps_series_when_other_listener_serves_same_url(self):
+        from metrics import WS_LISTENER_LAST_SEEN
+        url = 'https://shared-url.io'
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=[(_make_mock_session("s1"), True),
+                                       (_make_mock_session("s2"), True)]):
+            l1 = self.manager.create_listener(url)
+            l2 = self.manager.create_listener(url)  # second listener, same URL
+            # force distinct ids in _url_index: create_listener overwrites the index,
+            # simulate both being tracked
+            self.manager.listeners[l1.listener_id] = l1
+        try:
+            with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy", return_value=True):
+                self.manager.destroy_listener(l2.listener_id)
+            value = WS_LISTENER_LAST_SEEN.labels(url=url)._value.get()
+            self.assertGreater(value, 0)
+        finally:
+            with patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy", return_value=True):
+                self.manager.destroy_listener(l1.listener_id)
+
+    def test_start_session_failure_clears_per_url_metrics(self):
+        from metrics import WS_LISTENER_ACTIVE, WS_LISTENER_LAST_SEEN
+        url = 'https://fail-start.io'
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          return_value=(_make_mock_session(), True)):
+            listener = self.manager.create_listener(url)
+        # now make session creation fail for the retry path
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=Exception("browser dead")):
+            with patch.object(utils, "kill_orphaned_chrome", lambda *a: None):
+                with self.assertRaises(Exception):
+                    self.manager.create_listener(url)
+        samples = [s for s in WS_LISTENER_ACTIVE.collect()[0].samples
+                   if s.labels.get('url') == url]
+        self.assertEqual(
+            [s for s in WS_LISTENER_LAST_SEEN.collect()[0].samples
+             if s.labels.get('url') == url], [])
+        # active series removed too
+        self.assertEqual([s for s in samples], [])
 
 
 class TestWebSocketListenerEndpoints(unittest.TestCase):
