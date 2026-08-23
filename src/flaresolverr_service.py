@@ -446,6 +446,14 @@ class WebSocketListenerManager:
             logging.info("Recycle already in progress; skipping this cycle.")
             return
         try:
+            # A stale/delayed thread may arrive after a peer already completed
+            # this listener's recycle. Bail out instead of double-recycling a
+            # retired listener (which would orphan a live browser).
+            with self._lock:
+                if self.listeners.get(old_listener.listener_id) is not old_listener:
+                    logging.info(f"Listener {old_listener.listener_id} already "
+                                 f"retired; skipping stale recycle.")
+                    return
             url = old_listener.url
             try:
                 new_listener = self._spawn_replacement(old_listener)
@@ -462,8 +470,19 @@ class WebSocketListenerManager:
                     new_session.websocket_messages.extendleft(reversed(remaining))
                 new_listener.service_started_at = (
                         old_listener.service_started_at or old_listener.created_at)
+                # The successor is now a full primary; clear the shadow flag so
+                # cleanup_stale can reap/health-check/recycle it in the future.
+                new_listener.replacing = False
                 self._url_index[url] = new_listener.listener_id
-                old_session_id = old_listener.session_id
+            # Final re-drain under lock: any frames that landed in the old
+            # session's buffer after the merge above must not be dropped.
+            with self._lock:
+                old_session = SESSIONS_STORAGE.sessions.get(old_listener.session_id)
+                new_session = SESSIONS_STORAGE.sessions.get(new_listener.session_id)
+                if old_session is not None and new_session is not None:
+                    remaining = list(old_session.websocket_messages)
+                    old_session.websocket_messages.clear()
+                    new_session.websocket_messages.extendleft(reversed(remaining))
             # Retire old AFTER the swap, off the lock.
             self.retire_listener(old_listener.listener_id)
             logging.info(f"Recycled listener for {url}: "

@@ -732,6 +732,49 @@ class TestListenerRecycle(unittest.TestCase):
         self.assertIsNotNone(new_lst.service_started_at)
         self.assertEqual(new_lst.service_started_at, old.created_at)
 
+    def test_recycled_successor_is_recyclable_again(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        old = self._install_primary(mgr, "http://x", "old1")
+        store = flaresolverr_service.SESSIONS_STORAGE.sessions
+        fake, state = self._fake_create(store)
+
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=fake), \
+             patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
+                          return_value=True), \
+             patch("flaresolverr_service._register_listener_cdp"), \
+             patch("flaresolverr_service.func_timeout", side_effect=lambda t, f, a: f(*a)):
+            mgr._recycle_listener(old)
+
+        new_lid = mgr._url_index["http://x"]
+        self.assertIn(new_lid, mgr.listeners)
+        self.assertFalse(mgr.listeners[new_lid].replacing)
+
+    def test_stale_recycle_thread_is_noop(self):
+        mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
+        old = self._install_primary(mgr, "http://x", "old1")
+        store = flaresolverr_service.SESSIONS_STORAGE.sessions
+        fake, state = self._fake_create(store)
+
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create",
+                          side_effect=fake), \
+             patch.object(flaresolverr_service.SESSIONS_STORAGE, "destroy",
+                          return_value=True), \
+             patch("flaresolverr_service._register_listener_cdp"), \
+             patch("flaresolverr_service.func_timeout", side_effect=lambda t, f, a: f(*a)):
+            mgr._recycle_listener(old)
+
+        successor_lid = mgr._url_index["http://x"]
+        n_listeners_after_first = len(mgr.listeners)
+
+        # Simulate a stale thread arriving after the recycle completed.
+        with patch.object(flaresolverr_service.SESSIONS_STORAGE, "create") as m_create:
+            mgr._recycle_listener(old)
+        m_create.assert_not_called()
+        # index still points at the first successor; no duplicate added
+        self.assertEqual(mgr._url_index["http://x"], successor_lid)
+        self.assertEqual(len(mgr.listeners), n_listeners_after_first)
+
     def test_recycle_boot_failure_keeps_original(self):
         mgr = flaresolverr_service.WebSocketListenerManager(max_listeners=5)
         old = self._install_primary(mgr, "http://x", "old1")
