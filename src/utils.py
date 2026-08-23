@@ -168,6 +168,10 @@ def get_config_ws_listener_create_timeout() -> int:
     return int(os.environ.get('WS_LISTENER_CREATE_TIMEOUT', '90'))
 
 
+def get_config_ws_listener_max_lifetime() -> int:
+    return int(os.environ.get('WS_LISTENER_MAX_LIFETIME_MINUTES', '180'))
+
+
 def get_flaresolverr_version() -> str:
     global FLARESOLVERR_VERSION
     if FLARESOLVERR_VERSION is not None:
@@ -297,9 +301,8 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     options.add_argument('--headless=chrome')          # Force legacy headless (prevents --headless=new)
     options.add_argument('--disable-crash-reporter')   # Remove crashpad processes
     options.add_argument('--disable-crashpad-handler') # Remove crashpad processes
-    options.add_argument('--js-flags=--max-old-space-size=1024')  # Increase V8 heap
+    options.add_argument('--js-flags=--max-old-space-size=512')  # Bound V8 heap
 
-    options.add_argument('--memory-pressure-off')
     options.add_argument('--disable-features=IsolateOrigins,site-per-process,AudioServiceOutOfProcess')
     options.add_argument('--disable-site-isolation-trials')
     options.add_argument('--disable-v8-idle-tasks')

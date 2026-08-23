@@ -69,6 +69,12 @@ class TestWebsocketCapture(unittest.TestCase):
             self.assertEqual(utils.get_config_ws_listener_default_ttl(), 30)
             self.assertEqual(utils.get_config_ws_listener_default_max_msgs(), 500)
 
+    def test_ws_listener_max_lifetime_default(self):
+        with patch.dict('os.environ', {}, clear=True):
+            self.assertEqual(utils.get_config_ws_listener_max_lifetime(), 180)
+        with patch.dict('os.environ', {'WS_LISTENER_MAX_LIFETIME_MINUTES': '360'}):
+            self.assertEqual(utils.get_config_ws_listener_max_lifetime(), 360)
+
     def test_websocket_listener_dataclass_defaults(self):
         now = datetime.now()
         listener = flaresolverr_service.WebSocketListener(
