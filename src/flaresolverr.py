@@ -115,6 +115,7 @@ def update_lifecycle_gauges():
         metrics.GC_CHROME_DRIVERS.set(sum(
             1 for o in gc.get_objects()
             if isinstance(o, uc.Chrome)))
+        metrics.UNQUIT_CHROME_DRIVERS.set(len(uc.LIVE_CHROMES))
         try:
             with open('/proc/self/statm') as f:
                 rss_pages = int(f.read().split()[1])
@@ -160,6 +161,12 @@ def background_tasks_thread():
             update_lifecycle_gauges()
         except Exception as e:
             logging.error(f"Error in lifecycle gauges: {e}")
+
+        try:
+            if utils.get_config_enable_periodic_gc():
+                gc.collect()
+        except Exception as e:
+            logging.error(f"periodic gc failed: {e}")
 
         time.sleep(SESSION_HEALTH_CHECK_INTERVAL)
 

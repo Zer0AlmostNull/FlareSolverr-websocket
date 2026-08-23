@@ -296,6 +296,10 @@ def get_config_profile_dir_max_age() -> int:
     return int(os.environ.get('PROFILE_DIR_MAX_AGE_S', '600'))
 
 
+def get_config_enable_periodic_gc() -> bool:
+    return os.environ.get('ENABLE_PERIODIC_GC', 'false').lower() == 'true'
+
+
 def get_config_log_html() -> bool:
     return os.environ.get('LOG_HTML', 'false').lower() == 'true'
 

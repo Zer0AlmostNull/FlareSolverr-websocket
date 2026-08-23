@@ -117,6 +117,11 @@ PROCESS_RSS_BYTES = Gauge(
     documentation='Resident memory of the FlareSolverr process (from /proc/self/statm; 0 when unavailable)')
 
 
+UNQUIT_CHROME_DRIVERS = Gauge(
+    name='flaresolverr_unquit_chrome_drivers',
+    documentation='WeakSet-tracked Chrome instances never quit(); should stay flat near listener count')
+
+
 def serve(port):
     start_http_server(port=port)
     while True:

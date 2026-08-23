@@ -346,6 +346,12 @@ class TestDriverTimeoutHardening(unittest.TestCase):
             self.assertEqual(utils.get_config_page_load_timeout(), 30)
             self.assertEqual(utils.get_config_shutdown_grace(), 5)
 
+    def test_enable_periodic_gc_default_false(self):
+        with mock.patch.dict('os.environ', {}, clear=True):
+            self.assertFalse(utils.get_config_enable_periodic_gc())
+        with mock.patch.dict('os.environ', {'ENABLE_PERIODIC_GC': 'true'}):
+            self.assertTrue(utils.get_config_enable_periodic_gc())
+
     def test_harden_driver_timeouts_sets_all_layers(self):
         driver = mock.MagicMock()
         cc = mock.MagicMock()

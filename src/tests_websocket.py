@@ -1021,6 +1021,21 @@ class TestLifecycleGauges(unittest.TestCase):
         self.assertGreater(len(rss_samples), 0)
         self.assertGreaterEqual(rss_samples[0].value, 0)
 
+    def test_unquit_chrome_drivers_gauge(self):
+        # NOTE: SimpleNamespace lacks __weakref__ on CPython 3.14; the fake
+        # must be a plain-class instance so WeakSet.add() succeeds.
+        class FakeChrome:
+            pass
+
+        fake = FakeChrome()
+        uc_init.LIVE_CHROMES.add(fake)
+        try:
+            flaresolverr.update_lifecycle_gauges()
+            val = list(metrics.UNQUIT_CHROME_DRIVERS.collect())[0].samples[0].value
+            self.assertGreaterEqual(val, 1.0)
+        finally:
+            uc_init.LIVE_CHROMES.discard(fake)
+
 
 class TestChromeRetention(unittest.TestCase):
 
