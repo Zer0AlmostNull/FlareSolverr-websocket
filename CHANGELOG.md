@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+* Add zero-drop listener recycling: listeners are proactively recycled after `WS_LISTENER_MAX_LIFETIME_MINUTES` (default 180 min) via spawn-first handover — a replacement browser is launched in parallel, ownership of the URL slot swaps atomically on success, and buffers are merged so no captured frames are dropped. Single-flight mutex prevents concurrent recycles of the same listener.
+* Tune Chromium flags for long-lived headless listeners and preserve frame buffers across reconnects; ownership-safe index pops prevent recycle threads from racing the manager.
 * Derive listener gauges (`WS_LISTENERS_ACTIVE`, `WS_LISTENERS_RUNNING`, `WS_LISTENERS_STATUS`) from primary (indexed) listeners only so recycle shadows are invisible to dashboards; per-URL metrics now iterate `_url_index` directly.
 * Anchor `WS_LISTENER_UPTIME` at `service_started_at` (falling back to `created_at`) so uptime survives recycles.
 * Fix FIFO ordering of frames re-drained during the final pre-retire merge in `_recycle_listener` (append instead of prepend).
