@@ -1036,6 +1036,33 @@ class TestChromeRetention(unittest.TestCase):
         qsrc = inspect.getsource(uc_init.Chrome.quit)
         self.assertIn('LIVE_CHROMES.discard(self)', qsrc)
 
+    def test_quit_severs_reactor_and_options_backref(self):
+        qsrc = inspect.getsource(uc_init.Chrome.quit)
+        self.assertIn('handlers.clear()', qsrc)
+        self.assertIn('self.reactor = None', qsrc)
+        self.assertIn('_session', qsrc)
+
+    def test_quit_clears_handler_closures_and_severs(self):
+        handlers = Mock()
+        options = SimpleNamespace(_session='SENTINEL')
+        chrome = SimpleNamespace(
+            _quitted=False,
+            reactor=SimpleNamespace(event=SimpleNamespace(set=Mock()),
+                                    is_alive=Mock(return_value=False),
+                                    join=Mock(),
+                                    handlers=handlers),
+            options=options,
+            service=None,
+            browser_pid=None,          # None -> os.kill guarded by except
+            keep_user_data_dir=True,
+            user_data_dir='',
+            patcher=None)
+        with patch('undetected_chromedriver.os.kill'):
+            uc_init.Chrome.quit(chrome)
+        handlers.clear.assert_called_once()
+        self.assertIsNone(chrome.reactor)
+        self.assertIsNone(options._session)
+
     def test_kill_unquit_chromes_calls_ensure_close(self):
         # NOTE: SimpleNamespace lacks __weakref__ on CPython 3.14, so a
         # WeakSet.add(fake) would raise TypeError; use a plain class fake.

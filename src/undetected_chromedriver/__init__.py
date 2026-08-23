@@ -814,6 +814,19 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
         except AttributeError:
             pass
         try:
+            if getattr(self, "reactor", None) is not None:
+                self.reactor.handlers.clear()
+                self.reactor = None
+                logger.debug("reactor reference severed")
+        except AttributeError:
+            pass
+        try:
+            if getattr(self, "options", None) is not None:
+                self.options._session = None
+                logger.debug("options._session back-reference severed")
+        except AttributeError:
+            pass
+        try:
             self.service.stop()
             self.service.process.kill()
             self.command_executor.close()
