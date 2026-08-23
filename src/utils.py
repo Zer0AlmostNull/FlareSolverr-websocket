@@ -24,6 +24,7 @@ XVFB_DISPLAY = None
 PATCHED_DRIVER_PATH = None
 
 FS_CHROME_PROFILE_PREFIX = "flaresolverr_"
+MAX_SWEEPS_PER_CYCLE = 200
 
 
 def _get_boot_time() -> float:
@@ -256,7 +257,10 @@ def sweep_stale_profile_dirs(live_user_data_dirs: set, max_age_seconds: int = No
     process behind them and are older than max_age_seconds.
     kill_orphaned_chrome only reaches dirs whose browser is STILL RUNNING;
     dirs of already-dead drivers accumulated indefinitely (2200+ observed)."""
-    max_age = max_age_seconds or get_config_profile_dir_max_age()
+    if max_age_seconds is None:
+        max_age = get_config_profile_dir_max_age()
+    else:
+        max_age = max_age_seconds
     base = scan_dir or tempfile.gettempdir()
     cutoff = time.time() - max_age
     removed = 0
@@ -289,6 +293,8 @@ def sweep_stale_profile_dirs(live_user_data_dirs: set, max_age_seconds: int = No
             except Exception:
                 logging.debug("profile sweep skipped %s", getattr(entry, 'path', '?'),
                               exc_info=True)
+            if removed >= MAX_SWEEPS_PER_CYCLE:
+                break
     return removed
 
 

@@ -146,6 +146,7 @@ def background_tasks_thread():
         except Exception as e:
             logging.error(f"Error during ws listener cleanup: {e}")
 
+        live = set()
         try:
             live = flaresolverr_service._live_user_data_dirs()
             utils.kill_orphaned_chrome(live)
@@ -153,7 +154,9 @@ def background_tasks_thread():
             logging.error(f"Error during orphaned chrome cleanup: {e}")
 
         try:
-            utils.sweep_stale_profile_dirs(live)
+            removed = utils.sweep_stale_profile_dirs(live)
+            if removed:
+                logging.info("profile dir sweep removed %d stale dirs", removed)
         except Exception as e:
             logging.error(f"Error during profile dir sweep: {e}")
 

@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+* Final-review fix wave: profile-dir sweep safety escalation — `sweep_stale_profile_dirs` now caps deletions at `MAX_SWEEPS_PER_CYCLE = 200` per invocation (a 2,200-dir backlog drains over ~12 min instead of stalling the shared background thread in one burst) and the wire-in logs `profile dir sweep removed %d stale dirs` at INFO when anything was removed; `max_age_seconds=0` is now honored explicitly (previously `or`-falsified into the config default).
+* Final-review fix wave: idempotent-quit retry semantics preserved — `_quitted = True` moved from the top to the very end of `Chrome.quit()`, so a quit that raises mid-way can be retried instead of every subsequent call silently no-oping (early-return guard unchanged; no recursion hazard since quit never calls itself).
+* Final-review fix wave: UC Options-reuse RuntimeError guard preserved after collection — `quit()` now severs the back-reference with `delattr(self.options, '_session')` instead of `= None`, keeping the `hasattr(options, "_session")` class-level default intact so reusing a collected driver's options still raises as upstream intends.
+* Final-review fix wave: `background_tasks_thread` initializes `live = set()` before the orphan-kill try block so a failed `_live_user_data_dirs()` can no longer leave `live` unbound/stale for the subsequent profile sweep; watchdog test now asserts the sweep receives exactly the live dir set.
 * New gauge `flaresolverr_unquit_chrome_drivers` set by `update_lifecycle_gauges()` to `len(uc.LIVE_CHROMES)` — tracks Chrome instances that never reached `quit()` (force-killed at exit); should stay flat near the listener count, monotonic growth = driver-retention regression.
 * Add optional periodic gc escape hatch: `ENABLE_PERIODIC_GC` env knob (default `false`, getter `get_config_enable_periodic_gc()`) makes the background sweep thread run `gc.collect()` each cycle when enabled.
 * Tests: TestLifecycleGauges gains unquit-driver gauge test (weakref-able plain-class fake added to LIVE_CHROMES); TestDriverTimeoutHardening gains `get_config_enable_periodic_gc` default/override test.

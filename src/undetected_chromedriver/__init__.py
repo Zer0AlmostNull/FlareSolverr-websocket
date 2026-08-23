@@ -803,7 +803,6 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
     def quit(self):
         if getattr(self, "_quitted", False):
             return
-        self._quitted = True
         try:
             self.reactor.event.set()
             logger.debug("shutting down reactor")
@@ -822,7 +821,7 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
             pass
         try:
             if getattr(self, "options", None) is not None:
-                self.options._session = None
+                delattr(self.options, '_session')
                 logger.debug("options._session back-reference severed")
         except AttributeError:
             pass
@@ -876,6 +875,8 @@ class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
             LIVE_CHROMES.discard(self)
         except Exception:
             pass
+
+        self._quitted = True
 
     def __getattribute__(self, item):
         if not super().__getattribute__("debug"):

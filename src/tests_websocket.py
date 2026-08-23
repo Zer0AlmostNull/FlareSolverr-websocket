@@ -1055,7 +1055,7 @@ class TestChromeRetention(unittest.TestCase):
         qsrc = inspect.getsource(uc_init.Chrome.quit)
         self.assertIn('handlers.clear()', qsrc)
         self.assertIn('self.reactor = None', qsrc)
-        self.assertIn('_session', qsrc)
+        self.assertIn("_session", qsrc)
 
     def test_quit_clears_handler_closures_and_severs(self):
         handlers = Mock()
@@ -1076,7 +1076,43 @@ class TestChromeRetention(unittest.TestCase):
             uc_init.Chrome.quit(chrome)
         handlers.clear.assert_called_once()
         self.assertIsNone(chrome.reactor)
-        self.assertIsNone(options._session)
+        self.assertFalse(hasattr(options, '_session'))
+
+    def test_quit_failure_is_retryable(self):
+        # _quitted must only be set at the END of quit(), so a failed
+        # attempt can be retried instead of being silently swallowed.
+        chrome = SimpleNamespace(
+            reactor=SimpleNamespace(event=SimpleNamespace(
+                set=Mock(side_effect=RuntimeError("boom"))),
+                is_alive=Mock(return_value=False),
+                join=Mock(),
+                handlers=Mock()),
+            options=None,
+            service=None,
+            browser_pid=None,
+            keep_user_data_dir=True,
+            user_data_dir='',
+            patcher=None)
+        with patch('undetected_chromedriver.os.kill'):
+            with self.assertRaises(RuntimeError):
+                uc_init.Chrome.quit(chrome)
+        self.assertIsNone(getattr(chrome, '_quitted', None))
+
+    def test_quit_sets_quitted_on_success(self):
+        chrome = SimpleNamespace(
+            reactor=SimpleNamespace(event=SimpleNamespace(set=Mock()),
+                                    is_alive=Mock(return_value=False),
+                                    join=Mock(),
+                                    handlers=Mock()),
+            options=None,
+            service=None,
+            browser_pid=None,
+            keep_user_data_dir=True,
+            user_data_dir='',
+            patcher=None)
+        with patch('undetected_chromedriver.os.kill'):
+            uc_init.Chrome.quit(chrome)
+        self.assertTrue(chrome._quitted)
 
     def test_kill_unquit_chromes_calls_ensure_close(self):
         # NOTE: SimpleNamespace lacks __weakref__ on CPython 3.14, so a

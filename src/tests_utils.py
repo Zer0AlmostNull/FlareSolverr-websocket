@@ -153,6 +153,25 @@ class TestSweepStaleProfileDirs(unittest.TestCase):
         with mock.patch.dict('os.environ', {'PROFILE_DIR_MAX_AGE_S': '300'}):
             self.assertEqual(utils.get_config_profile_dir_max_age(), 300)
 
+    def test_explicit_zero_max_age_sweeps_everything(self):
+        n = utils.sweep_stale_profile_dirs(set(), max_age_seconds=0, scan_dir=self.tmp)
+        self.assertGreaterEqual(n, 1)
+        self.assertFalse(os.path.exists(self.old))
+
+    def test_burst_cap_limits_deletions_per_cycle(self):
+        extra = [os.path.join(self.tmp, f'flaresolverr_bulk_{i}')
+                 for i in range(utils.MAX_SWEEPS_PER_CYCLE + 10)]
+        for d in extra:
+            os.mkdir(d)
+            old_t = time.time() - 3600
+            os.utime(d, (old_t, old_t))
+        stale = extra + [self.old]
+        removed = utils.sweep_stale_profile_dirs(set(), max_age_seconds=600, scan_dir=self.tmp)
+        remaining = sum(1 for d in stale if os.path.exists(d))
+        self.assertLessEqual(removed, utils.MAX_SWEEPS_PER_CYCLE)
+        self.assertEqual(removed + remaining, len(stale))
+        self.assertGreater(remaining, 0)   # backlog left for next cycle
+
 
 class TestGetWebDriverFailureReap(unittest.TestCase):
 
@@ -317,7 +336,8 @@ class TestBackgroundTasksThreadWatchdog(unittest.TestCase):
 
     def test_watchdog_calls_kill_orphaned_with_live_dirs(self):
         with mock.patch("utils.kill_orphaned_chrome") as kill_mock, \
-             mock.patch("utils.sweep_stale_profile_dirs"), \
+             mock.patch("utils.sweep_stale_profile_dirs",
+                        return_value=0) as sweep_mock, \
              mock.patch.object(flaresolverr_service, "_live_user_data_dirs", return_value={"/tmp/live_watchdog"}) as live_mock, \
              mock.patch("flaresolverr.flaresolverr_service.SESSIONS_STORAGE.cleanup_stale_sessions"), \
              mock.patch("flaresolverr.ws_listener_manager.cleanup_stale"), \
@@ -330,6 +350,7 @@ class TestBackgroundTasksThreadWatchdog(unittest.TestCase):
 
             live_mock.assert_called_once()
             kill_mock.assert_called_once_with({"/tmp/live_watchdog"})
+            sweep_mock.assert_called_once_with({"/tmp/live_watchdog"})
 
 
 class TestDriverTimeoutHardening(unittest.TestCase):
