@@ -3,9 +3,12 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+from unittest.mock import MagicMock, patch
 
 import utils
 import flaresolverr_service
@@ -312,6 +315,60 @@ class TestDriverTimeoutHardening(unittest.TestCase):
         utils._harden_driver_timeouts(driver)
         executor.set_timeout.assert_called_once_with(120)
         driver.set_page_load_timeout.assert_called_once_with(75)
+
+
+class TestSafeQuit(unittest.TestCase):
+
+    def _mk_driver(self, quit_behavior=None):
+        driver = MagicMock()
+        driver.service.process.pid = 1111
+        driver.browser_pid = 2222
+        driver._fs_user_data_dir = '/tmp/fs_test_profile'
+        driver.service.send_remote_shutdown_command = MagicMock()
+        if quit_behavior:
+            driver.quit.side_effect = quit_behavior
+        return driver
+
+    def test_safe_quit_normal_path_no_escalation(self):
+        driver = self._mk_driver()
+        with patch.object(utils, '_escalate_kill') as esc, \
+             patch.object(utils.time, 'sleep'):
+            utils.safe_quit(driver)
+        driver.quit.assert_called_once()
+        esc.assert_not_called()
+
+    def test_safe_quit_escalates_on_hung_quit(self):
+        def hang():
+            time.sleep(30)
+        driver = self._mk_driver(quit_behavior=hang)
+        with patch.object(utils, '_escalate_kill') as esc, \
+             patch.dict('os.environ', {'SHUTDOWN_GRACE': '1'}):
+            start = time.monotonic()
+            utils.safe_quit(driver)
+            elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 10)          # did NOT wait 30s
+        esc.assert_called_once_with(driver, '/tmp/fs_test_profile')
+
+    def test_bounded_shutdown_thread_abandoned_after_grace(self):
+        driver = self._mk_driver()
+        release = threading.Event()
+        slow = MagicMock(side_effect=lambda: release.wait(30))
+        driver.service.send_remote_shutdown_command = slow
+        with patch.object(utils, '_escalate_kill'), \
+             patch.dict('os.environ', {'SHUTDOWN_GRACE': '1'}):
+            utils.safe_quit(driver)
+        slow.assert_called_once()             # ran bounded, not forever
+
+    def test_escalate_kill_terms_then_kills_and_sweeps(self):
+        driver = self._mk_driver()
+        with patch.object(utils.os, 'kill') as m_kill, \
+             patch.object(utils, '_kill_chrome_by_user_data_dir') as m_sweep, \
+             patch.object(utils.time, 'sleep'):
+            utils._escalate_kill(driver, '/tmp/fs_test_profile')
+        kill_calls = [c.args[0] for c in m_kill.call_args_list]
+        self.assertIn(1111, kill_calls)
+        self.assertIn(2222, kill_calls)
+        m_sweep.assert_called_once_with('/tmp/fs_test_profile')
 
 
 if __name__ == "__main__":

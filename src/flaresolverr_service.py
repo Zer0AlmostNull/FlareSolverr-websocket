@@ -852,7 +852,7 @@ def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
         if not req.session and driver is not None:
             if utils.PLATFORM_VERSION == "nt":
                 driver.close()
-            driver.quit()
+            utils.safe_quit(driver)
             logging.debug('A used instance of webdriver has been destroyed')
 
 def click_verify(driver: WebDriver, num_tabs: int = 1):

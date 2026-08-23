@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 
@@ -61,6 +62,79 @@ def _kill_chrome_by_user_data_dir(user_data_dir: str) -> None:
         shutil.rmtree(user_data_dir, ignore_errors=True)
     except Exception:
         pass
+
+
+def _escalate_kill(driver, user_data_dir):
+    """Best-effort forceful teardown for a driver whose quit() hung:
+    TERM->KILL chromedriver + browser pids, then sweep the profile dir
+    (reuses the orphan-reaper's TERM/KILL/rmtree machinery)."""
+    service = getattr(driver, 'service', None)
+    proc = getattr(service, 'process', None)
+    pids = [getattr(proc, 'pid', None), getattr(driver, 'browser_pid', None)]
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in pids:
+            if isinstance(pid, int) and pid > 0:
+                try:
+                    os.kill(pid, sig)
+                except Exception:
+                    pass
+        if sig == signal.SIGTERM:
+            time.sleep(2)
+    if user_data_dir:
+        try:
+            _kill_chrome_by_user_data_dir(user_data_dir)
+        except Exception:
+            logging.debug("profile sweep after escalation failed", exc_info=True)
+
+
+def safe_quit(driver, grace=None):
+    """driver.quit() that cannot hang forever. UC's quit() does an un-timeouted
+    urlopen(/shutdown) against chromedriver before killing it; a hung-but-alive
+    chromedriver therefore wedged destroy() indefinitely, leaking the entire
+    process tree. Here: (a) the chromedriver shutdown-command is run on a
+    daemon thread we abandon after `grace` seconds; (b) driver.quit() runs on
+    a daemon thread abandoned after grace*2; (c) an escalation timer
+    force-kills pids and sweeps the profile if quit() hasn't returned within
+    grace*2."""
+    grace = grace or get_config_shutdown_grace()
+    service = getattr(driver, 'service', None)
+    orig_shutdown = getattr(service, 'send_remote_shutdown_command', None)
+
+    def bounded_shutdown():
+        t = threading.Thread(target=orig_shutdown, daemon=True)
+        t.start()
+        t.join(grace)
+
+    if callable(orig_shutdown):
+        try:
+            service.send_remote_shutdown_command = bounded_shutdown
+        except Exception:
+            logging.debug("could not bound send_remote_shutdown_command", exc_info=True)
+    udd = getattr(driver, '_fs_user_data_dir', None)
+    killer = threading.Timer(grace * 2, _escalate_kill, args=(driver, udd))
+    killer.daemon = True
+    killer.start()
+    outcome = {}
+
+    def do_quit():
+        try:
+            driver.quit()
+        except BaseException as e:
+            outcome['error'] = e
+
+    try:
+        if callable(orig_shutdown):
+            try:
+                bounded_shutdown()
+            except Exception:
+                logging.debug("bounded shutdown-command failed", exc_info=True)
+        quitter = threading.Thread(target=do_quit, daemon=True)
+        quitter.start()
+        quitter.join(grace * 2)
+        if 'error' in outcome:
+            raise outcome['error']
+    finally:
+        killer.cancel()
 
 
 def _harden_driver_timeouts(driver):
@@ -582,7 +656,7 @@ def get_user_agent(driver=None) -> str:
         if driver is not None:
             if PLATFORM_VERSION == "nt":
                 driver.close()
-            driver.quit()
+            safe_quit(driver)
 
 
 def start_xvfb_display():
