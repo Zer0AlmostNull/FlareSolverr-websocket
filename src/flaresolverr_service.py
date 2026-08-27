@@ -85,6 +85,7 @@ class WebSocketListener:
     url: str = ""
     created_at: datetime = field(default_factory=datetime.now)
     last_heartbeat: datetime = field(default_factory=datetime.now)
+    last_frame_received_at: datetime = field(default_factory=datetime.now)
     ttl_minutes: int = 30
     max_messages: int = 2000
     status: str = "starting"  # starting | running | unhealthy | failed
@@ -142,6 +143,15 @@ def _websocket_message_handler(session, event, log_level=logging.INFO, track_met
     if track_metrics:
         frame_type_label = "received" if frame_type == "webSocketFrameReceived" else "sent"
         WS_MESSAGES_TOTAL.labels(url=url, type=frame_type_label).inc()
+
+    # Track last frame received time for zombie watchdog (only for received frames)
+    if frame_type == "webSocketFrameReceived":
+        from flaresolverr import ws_listener_manager
+        if session.session_id and session.session_id.startswith("ws_listener_"):
+            listener_id = session.session_id[len("ws_listener_"):]
+            listener = ws_listener_manager.listeners.get(listener_id)
+            if listener:
+                listener.last_frame_received_at = datetime.now()
 
 
 def _register_listener_cdp(session):
@@ -233,6 +243,7 @@ class WebSocketListenerManager:
                     listener.session_id = session.session_id
                     listener.status = "running"
                     listener.error_message = ""
+                    listener.last_frame_received_at = datetime.now()
             self._update_gauges()
             self._update_per_url_metrics()
         except Exception as e:
@@ -562,6 +573,14 @@ class WebSocketListenerManager:
                 WS_LISTENERS_TOTAL.labels(event="session_missing").inc()
                 self.destroy_listener(listener_id)
                 continue
+            # Zombie watchdog: recycle if no frames received for 60s
+            if listener.status == "running" and listener.last_frame_received_at:
+                silence = (now - listener.last_frame_received_at).total_seconds()
+                if silence > 60:
+                    logging.warning(f"Listener {listener_id} zombie detected: {silence:.0f}s no frames -> recycling")
+                    t = threading.Thread(target=self._recycle_listener, args=(listener,), daemon=True)
+                    t.start()
+                    continue
             try:
                 _ = session.driver.current_url
                 if listener.status != "running":
