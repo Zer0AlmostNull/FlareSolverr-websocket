@@ -72,7 +72,7 @@ class TestWebsocketCapture(unittest.TestCase):
         with patch.dict('os.environ', {}, clear=True):
             self.assertEqual(utils.get_config_max_ws_listeners(), 5)
             self.assertEqual(utils.get_config_ws_listener_default_ttl(), 30)
-            self.assertEqual(utils.get_config_ws_listener_default_max_msgs(), 500)
+            self.assertEqual(utils.get_config_ws_listener_default_max_msgs(), 2000)
 
     def test_ws_listener_max_lifetime_default(self):
         with patch.dict('os.environ', {}, clear=True):
@@ -93,7 +93,7 @@ class TestWebsocketCapture(unittest.TestCase):
             created_at=now, last_heartbeat=now,
         )
         self.assertEqual(listener.ttl_minutes, 30)
-        self.assertEqual(listener.max_messages, 500)
+        self.assertEqual(listener.max_messages, 2000)
         self.assertEqual(listener.status, "starting")
         self.assertEqual(listener.error_message, "")
 

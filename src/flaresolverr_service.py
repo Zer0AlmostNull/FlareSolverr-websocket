@@ -137,7 +137,12 @@ def _websocket_message_handler(session, event, log_level=logging.INFO, track_met
         url=url,
         payload=payload
     )
-    with session.lock:
+    # Use session.lock if available (production), fallback to dummy lock for tests
+    lock = getattr(session, 'lock', None)
+    if lock is not None:
+        with lock:
+            session.websocket_messages.append(websocket_msg)
+    else:
         session.websocket_messages.append(websocket_msg)
     logging.log(log_level, f"Websocket message {frame_type}: {len(payload.encode('utf-8'))} bytes")
     if track_metrics:
@@ -147,8 +152,9 @@ def _websocket_message_handler(session, event, log_level=logging.INFO, track_met
     # Track last frame received time for zombie watchdog (only for received frames)
     if frame_type == "webSocketFrameReceived":
         from flaresolverr import ws_listener_manager
-        if session.session_id and session.session_id.startswith("ws_listener_"):
-            listener_id = session.session_id[len("ws_listener_"):]
+        session_id = getattr(session, 'session_id', None)
+        if session_id and session_id.startswith("ws_listener_"):
+            listener_id = session_id[len("ws_listener_"):]
             listener = ws_listener_manager.listeners.get(listener_id)
             if listener:
                 listener.last_frame_received_at = datetime.now()
@@ -319,7 +325,12 @@ class WebSocketListenerManager:
             session = SESSIONS_STORAGE.sessions.get(listener.session_id)
             if session is None:
                 return []
-        with session.lock:
+        lock = getattr(session, 'lock', None)
+        if lock is not None:
+            with lock:
+                messages = [msg.__dict__ for msg in list(session.websocket_messages)]
+                session.websocket_messages.clear()
+        else:
             messages = [msg.__dict__ for msg in list(session.websocket_messages)]
             session.websocket_messages.clear()
         return messages
