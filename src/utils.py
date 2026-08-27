@@ -319,7 +319,7 @@ def get_config_disable_media() -> bool:
 
 
 def get_config_websocket_max_messages() -> int:
-    return int(os.environ.get('WEBSOCKET_MAX_MESSAGES', '100'))
+    return int(os.environ.get('WEBSOCKET_MAX_MESSAGES', '2000'))
 
 
 def get_config_max_ws_listeners() -> int:
@@ -331,7 +331,7 @@ def get_config_ws_listener_default_ttl() -> int:
 
 
 def get_config_ws_listener_default_max_msgs() -> int:
-    return int(os.environ.get('WS_LISTENER_DEFAULT_MAX_MSGS', '500'))
+    return int(os.environ.get('WS_LISTENER_DEFAULT_MAX_MSGS', '2000'))
 
 
 def get_config_ws_listener_create_timeout() -> int:

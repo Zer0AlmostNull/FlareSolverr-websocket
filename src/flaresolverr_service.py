@@ -86,7 +86,7 @@ class WebSocketListener:
     created_at: datetime = field(default_factory=datetime.now)
     last_heartbeat: datetime = field(default_factory=datetime.now)
     ttl_minutes: int = 30
-    max_messages: int = 500
+    max_messages: int = 2000
     status: str = "starting"  # starting | running | unhealthy | failed
     error_message: str = ""
     reconnect_attempts: int = 0
