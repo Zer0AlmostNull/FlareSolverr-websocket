@@ -136,7 +136,8 @@ def _websocket_message_handler(session, event, log_level=logging.INFO, track_met
         url=url,
         payload=payload
     )
-    session.websocket_messages.append(websocket_msg)
+    with session.lock:
+        session.websocket_messages.append(websocket_msg)
     logging.log(log_level, f"Websocket message {frame_type}: {len(payload.encode('utf-8'))} bytes")
     if track_metrics:
         frame_type_label = "received" if frame_type == "webSocketFrameReceived" else "sent"
@@ -307,9 +308,10 @@ class WebSocketListenerManager:
             session = SESSIONS_STORAGE.sessions.get(listener.session_id)
             if session is None:
                 return []
+        with session.lock:
             messages = [msg.__dict__ for msg in list(session.websocket_messages)]
             session.websocket_messages.clear()
-            return messages
+        return messages
 
     def get_listener_payload(self, listener_id: str):
         listener = self._locked_get(listener_id)

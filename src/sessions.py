@@ -1,3 +1,4 @@
+import threading
 from collections import deque
 import logging
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ class Session:
     last_known_url: str = ""
     url_cache_time: float = 0
     target_url: str = ""
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     def lifetime(self) -> timedelta:
         return datetime.now() - self.created_at
