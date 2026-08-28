@@ -49,14 +49,14 @@ VOLUME /config
 COPY requirements.txt .
 RUN pip install -r requirements.txt \
     # Remove temporary files
-    && rm -rf /root/.cache
+    && rm -rf /root/.cache \
+    && mkdir -p /app/.local/share "/app/.config/chromium/Crash Reports/pending" \
+    && chown -R flaresolverr:flaresolverr /app
 
 USER flaresolverr
 
-RUN mkdir -p "/app/.config/chromium/Crash Reports/pending"
-
-COPY src .
-COPY package.json ../
+COPY --chown=flaresolverr:flaresolverr src .
+COPY --chown=flaresolverr:flaresolverr package.json ../
 
 EXPOSE 8191
 

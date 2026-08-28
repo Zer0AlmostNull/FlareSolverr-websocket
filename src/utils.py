@@ -23,7 +23,8 @@ USER_AGENT = None
 XVFB_DISPLAY = None
 PATCHED_DRIVER_PATH = None
 
-VALID_PROFILE_PREFIXES = ("flaresolverr_", "tabmgr_", "tabmgr_standby_")
+FS_CHROME_PROFILE_PREFIX = "flaresolverr_"
+VALID_PROFILE_PREFIXES = (FS_CHROME_PROFILE_PREFIX, "tabmgr_", "tabmgr_standby_")
 MAX_SWEEPS_PER_CYCLE = 200
 
 
