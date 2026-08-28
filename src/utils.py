@@ -23,7 +23,7 @@ USER_AGENT = None
 XVFB_DISPLAY = None
 PATCHED_DRIVER_PATH = None
 
-FS_CHROME_PROFILE_PREFIX = "flaresolverr_"
+VALID_PROFILE_PREFIXES = ("flaresolverr_", "tabmgr_", "tabmgr_standby_")
 MAX_SWEEPS_PER_CYCLE = 200
 
 
@@ -278,7 +278,7 @@ def sweep_stale_profile_dirs(live_user_data_dirs: set, max_age_seconds: int = No
                 if not entry.is_dir():
                     continue
                 name = entry.name
-                if not name.startswith(FS_CHROME_PROFILE_PREFIX):
+                if not any(name.startswith(p) for p in VALID_PROFILE_PREFIXES):
                     continue
                 full = entry.path
                 if full in live_user_data_dirs or name in live_user_data_dirs:

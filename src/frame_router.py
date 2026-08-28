@@ -105,55 +105,50 @@ def extract_semantic_messages(payload: str) -> List[Tuple[str, str, bool]]:
                 results.append(("gmgn:chain_stat", line, False))
                 continue
 
-            # public_broadcast array decomposition
-            if channel == "public_broadcast":
-                data = obj.get("data")
-                if isinstance(data, list) and len(data) > 0:
-                    for item in data:
-                        if isinstance(item, dict):
-                            ed = item.get("ed") if isinstance(item.get("ed"), dict) else {}
-                            sig_id = ed.get("sig_id")
-                            tw_id = ed.get("id") if item.get("et") == "twitter_watched" else None
-                            if sig_id is not None:
-                                key = f"gmgn:sig:{sig_id}"
-                            elif tw_id is not None:
-                                key = f"gmgn:tw:{tw_id}"
-                            else:
-                                item_json = json.dumps(item, separators=(',', ':'))
-                                key = f"gmgn:item:{hashlib.sha256(item_json.encode('utf-8')).hexdigest()[:8]}"
-                            norm_item = json.dumps(item, separators=(',', ':'))
-                            results.append((key, norm_item, True))
+            # GMGN public_broadcast array decomposition
+            if channel == "public_broadcast" or obj.get("channel") == "public_broadcast":
+                data_list = obj.get("data")
+                if isinstance(data_list, list) and data_list:
+                    for item in data_list:
+                        if not isinstance(item, dict):
+                            continue
+                        ed = item.get("ed") if isinstance(item.get("ed"), dict) else {}
+                        sig_id = ed.get("sig_id") or ""
+                        tw_id = ed.get("id") or ""
+                        if sig_id:
+                            results.append((f"gmgn:sig:{sig_id}", json.dumps(item), True))
+                        elif tw_id:
+                            results.append((f"gmgn:tw:{tw_id}", json.dumps(item), True))
                         else:
-                            results.append((f"gmgn:raw:{item}", str(item), True))
-                elif isinstance(data, list) and len(data) == 0:
+                            h = hashlib.sha256(json.dumps(item).encode("utf-8", errors="replace")).hexdigest()[:16]
+                            results.append((f"gmgn:broadcast:{h}", json.dumps(item), True))
+                    if results:
+                        continue
+                elif isinstance(data_list, list) and len(data_list) == 0:
                     results.append(("gmgn:public_broadcast:empty", line, False))
-                else:
-                    results.append((line, line, True))
-                continue
+                    continue
 
-            # callout_global
-            if t == "callout_global" or channel == "callout_global":
-                data = obj.get("data")
-                uids = []
-                if isinstance(data, list):
-                    uids = [str(d.get("uid")) for d in data if isinstance(d, dict) and d.get("uid") is not None]
-                key = f"gmgn:callout:{':'.join(uids)}" if uids else "gmgn:callout"
-                results.append((key, line, True))
-                continue
+            # GMGN callout_global
+            if t == "callout_global" or channel == "callout_global" or obj.get("t") == "callout_global":
+                data_list = obj.get("data")
+                if isinstance(data_list, list) and data_list:
+                    uids = [str(d.get("uid")) for d in data_list if isinstance(d, dict) and d.get("uid")]
+                    if uids:
+                        results.append((f"gmgn:callout:{':'.join(uids)}", line, True))
+                        continue
 
-            # route_info
-            if t == "route_info" or channel == "route_info":
-                d = obj.get("d")
-                counter = ""
-                if isinstance(d, dict) and d:
-                    counter = str(next(iter(d.values())))
-                key = f"gmgn:route:{counter}" if counter else "gmgn:route"
-                results.append((key, line, False))
-                continue
+            # GMGN route_info
+            if t == "route_info" or channel == "route_info" or obj.get("t") == "route_info":
+                d_obj = obj.get("d") if isinstance(obj.get("d"), dict) else {}
+                seq = str(d_obj.get("counter") or d_obj.get("seq") or "")
+                if seq:
+                    results.append((f"gmgn:route:{seq}", line, False))
+                    continue
 
-            # Other GMGN channels (e.g. token_social_info) -> data frame
+            # Other GMGN channels (e.g. token_social_info, swap, kline) -> data frame with payload hash
             if channel:
-                key = f"gmgn:{channel}"
+                h = hashlib.sha256(line.encode("utf-8", errors="replace")).hexdigest()[:16]
+                key = f"gmgn:{channel}:{h}"
                 results.append((key, line, True))
                 continue
 
@@ -312,7 +307,7 @@ class FrameRouter:
         if not tab:
             return "failed"
         s = tab.status
-        if s in ("starting", "warming", "handoff"):
+        if s in ("starting", "warming", "handoff", "reloading"):
             return "starting"
         if s == "running":
             return "running"

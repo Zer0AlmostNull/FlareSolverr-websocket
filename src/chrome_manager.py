@@ -332,7 +332,11 @@ class ChromeManager:
         if self._loop is None or self._loop.is_closed() or not self._loop.is_running():
             raise RuntimeError("ChromeManager event loop not running")
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(timeout=timeout)
+        try:
+            return fut.result(timeout=timeout)
+        except Exception:
+            fut.cancel()
+            raise
 
     # ---- legacy metric accounting (single source of truth = registry) ---
 
@@ -456,20 +460,38 @@ class ChromeManager:
             # async work completes without a separate run_forever.
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
+            prev_browser = self._browser
             prev_shared_dir = getattr(self, "_shared_browser_user_data_dir", None)
 
             async def _recover_coro():
+                # Force-kill pre-crash browser tree if still running
+                if prev_browser is not None:
+                    try:
+                        pid = getattr(prev_browser, "_process_pid", None)
+                        if pid:
+                            import signal
+                            import psutil
+                            proc = psutil.Process(pid)
+                            for child in proc.children(recursive=True):
+                                try:
+                                    child.kill()
+                                except Exception:
+                                    pass
+                            proc.kill()
+                    except Exception:
+                        pass
+
                 self._browser = await _launch_browser()
                 self._shared_browser_user_data_dir = getattr(_launch_browser, "user_data_dir", None)
                 # Re-register the shared dir with the orphan sweeper. Unregister
                 # the OLD (pre-crash) dir FIRST so a pre-crash Chrome that is still
                 # alive can be reaped as an orphan and its profile dir swept
-                # (quorum A6/C12 — previously the old dir stayed registered
-                # forever and leaked both the process and the profile dir).
                 try:
                     import flaresolverr_service as fs
                     if prev_shared_dir:
                         fs.unregister_shared_browser_dir(prev_shared_dir)
+                        if os.path.exists(prev_shared_dir):
+                            shutil.rmtree(prev_shared_dir, ignore_errors=True)
                     fs.register_shared_browser_dir(self._shared_browser_user_data_dir)
                 except Exception as e:
                     logger.warning(f"ChromeManager: failed to re-register shared dir after recovery: {e}")
@@ -527,9 +549,7 @@ class ChromeManager:
         # Legacy metrics: recompute from the (now empty) registry so the gauges
         # drop to zero instead of staying inflated for a later start()/recreate.
         self._recompute_ws_gauges()
-        # B1: shut down the recycle executor with wait=False (NOT wait=True — a
-        # worker blocked in _call on the shutting-down loop can stall up to
-        # LOOP_CALL_TIMEOUT/120s). Null it so a later start() re-creates it.
+        # B1: shut down the recycle executor with wait=False
         if self._recycle_executor is not None:
             self._recycle_executor.shutdown(wait=False, cancel_futures=True)
             self._recycle_executor = None
@@ -548,13 +568,13 @@ class ChromeManager:
             logger.info("ChromeManager: restarting browser process")
             # Capture primary URLs before stopping
             with self._lock:
-                primaries = {url: self._tabs[tid].url for url, tid in self._url_index.items()}
+                primaries = [self._tabs[tid].url for tid in self._url_index.values() if tid in self._tabs]
             # Stop current browser
             self.stop()
             # Start fresh
             self.start()
             # Recreate primary tabs
-            for url in primaries.values():
+            for url in primaries:
                 try:
                     self.create_tab(url)
                 except Exception as e:
@@ -740,24 +760,46 @@ class ChromeManager:
 
     def get_memory_usage_gb(self) -> float:
         """Best-effort Chrome process RSS (browser + children); falls back to 0.
+        Inspects Linux cgroup memory if running in a container, or calculates total
+        RSS of active and standby Chrome process trees."""
+        # Try cgroup v2
+        try:
+            with open("/sys/fs/cgroup/memory.current", "r") as f:
+                val = int(f.read().strip())
+                if val > 0:
+                    return val / 1e9
+        except Exception:
+            pass
+        # Try cgroup v1
+        try:
+            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r") as f:
+                val = int(f.read().strip())
+                if val > 0:
+                    return val / 1e9
+        except Exception:
+            pass
 
-        nodriver's Browser exposes no public `pid`; the real Chrome OS pid is the
-        private `_process_pid` (set on launch). Reading /proc/self/statm would
-        measure the FlareSolverr PYTHON process, not Chrome, so we deliberately do
-        NOT fall back to it — a wrong reading would both blind the memory-pressure
-        restart and misfire it off unrelated Python growth."""
         try:
             import psutil
-            pid = getattr(self._browser, "_process_pid", None)
-            if pid is not None:
-                proc = psutil.Process(pid)
-                total = proc.memory_info().rss / 1e9
-                for child in proc.children(recursive=True):
-                    try:
-                        total += child.memory_info().rss / 1e9
-                    except Exception:
-                        pass
-                return total
+            total = 0.0
+            pids = set()
+            for browser_obj in (self._browser, getattr(self, "_standby_browser", None)):
+                pid = getattr(browser_obj, "_process_pid", None)
+                if pid:
+                    pids.add(pid)
+
+            for pid in pids:
+                try:
+                    proc = psutil.Process(pid)
+                    total += proc.memory_info().rss / 1e9
+                    for child in proc.children(recursive=True):
+                        try:
+                            total += child.memory_info().rss / 1e9
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            return total
         except Exception:
             pass
         return 0.0
@@ -876,7 +918,8 @@ class ChromeManager:
             if tail:
                 with new_tab.lock:
                     existing = list(new_tab.frame_buffer)
-                    merged = router._merge_dedup(existing, tail, maxlen=getattr(new_tab.frame_buffer, "maxlen", 2000), cross_process=True)
+                    # Merge older tail frames before existing newer frames to preserve strict chronological ordering
+                    merged = router._merge_dedup(tail, existing, maxlen=getattr(new_tab.frame_buffer, "maxlen", 2000), cross_process=True)
                     new_tab.frame_buffer.clear()
                     new_tab.frame_buffer.extend(merged)
 
@@ -890,11 +933,23 @@ class ChromeManager:
         old_user_data_dir = getattr(self, "_shared_browser_user_data_dir", None)
         if old_browser is not None:
             try:
-                stop = getattr(old_browser, "stop", None)
-                if callable(stop):
-                    stop()
-            except Exception as e:
-                logger.warning(f"ChromeManager: old browser stop error: {e}")
+                pid = getattr(old_browser, "_process_pid", None)
+                if pid:
+                    import psutil
+                    proc = psutil.Process(pid)
+                    for child in proc.children(recursive=True):
+                        try:
+                            child.kill()
+                        except Exception:
+                            pass
+                    proc.kill()
+            except Exception:
+                try:
+                    stop = getattr(old_browser, "stop", None)
+                    if callable(stop):
+                        stop()
+                except Exception as e:
+                    logger.warning(f"ChromeManager: old browser stop error: {e}")
 
         if old_user_data_dir:
             try:
@@ -922,6 +977,8 @@ class ChromeManager:
         if not self._restart_lock.acquire(blocking=False):
             logger.info("ChromeManager: recycle_browser_standby skipped (restart/recover in progress)")
             return False
+        standby_browser = None
+        standby_dir = None
         try:
             logger.info(f"ChromeManager: starting standby browser recycle (reason={reason})")
             with self._lock:
@@ -930,15 +987,48 @@ class ChromeManager:
                 logger.info("ChromeManager: no active tabs to migrate to standby browser")
                 return False
             standby_browser = self.launch_standby_browser()
+            self._standby_browser = standby_browser
             standby_dir = getattr(standby_browser, "user_data_dir", None)
             new_tabs = self.warm_standby_tabs(standby_browser, urls)
             self.swap_standby_browser(standby_browser, standby_dir, new_tabs, router, quiescence_s=quiescence_s)
+            self._standby_browser = None
             logger.info(f"ChromeManager: standby browser recycle completed (reason={reason})")
             return True
         except Exception as e:
             logger.error(f"ChromeManager: standby browser recycle failed: {e}")
+            if standby_browser is not None:
+                try:
+                    pid = getattr(standby_browser, "_process_pid", None)
+                    if pid:
+                        import psutil
+                        proc = psutil.Process(pid)
+                        for child in proc.children(recursive=True):
+                            try:
+                                child.kill()
+                            except Exception:
+                                pass
+                        proc.kill()
+                except Exception:
+                    try:
+                        stop = getattr(standby_browser, "stop", None)
+                        if callable(stop):
+                            stop()
+                    except Exception:
+                        pass
+            if standby_dir:
+                try:
+                    import flaresolverr_service as fs
+                    fs.unregister_shared_browser_dir(standby_dir)
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(standby_dir):
+                        shutil.rmtree(standby_dir, ignore_errors=True)
+                except Exception:
+                    pass
             raise
         finally:
+            self._standby_browser = None
             self._restart_lock.release()
 
 

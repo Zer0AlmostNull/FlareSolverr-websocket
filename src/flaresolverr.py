@@ -116,8 +116,10 @@ def _reset_tab_manager():
 
 
 def _live(tab) -> bool:
-    """A tab is 'live' (serving) when it is not being retired/closed."""
-    return tab is not None and tab.status not in ("retiring",)
+    """A tab is 'live' (serving) when it is in an active/reloading state and not retired or crashed."""
+    if tab is None:
+        return False
+    return getattr(tab, "status", "") in ("starting", "warming", "handoff", "running", "reloading")
 
 
 def _release_url_metrics(m, url: str):
@@ -382,7 +384,8 @@ def _tab_manager_maintenance():
         if is_stalled:
             stalled_tabs.append((url, tab))
         else:
-            tab.consecutive_stalls = 0
+            with tab.lock:
+                tab.consecutive_stalls = 0
 
     import metrics as m
 
@@ -390,7 +393,8 @@ def _tab_manager_maintenance():
     if len(stalled_tabs) >= 2:
         for url, tab in stalled_tabs:
             m.WS_STALL_ESCALATIONS.labels(url=url, tier="3").inc()
-            tab.consecutive_stalls = max(getattr(tab, "consecutive_stalls", 0), 3)
+            with tab.lock:
+                tab.consecutive_stalls = max(getattr(tab, "consecutive_stalls", 0), 3)
         if now >= _browser_restart_cooldown_until:
             logger.warning(f"TabManager: multiple tabs stalled ({[u for u, _ in stalled_tabs]}); escalating to Tier 3 standby recycle")
             _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
@@ -398,30 +402,35 @@ def _tab_manager_maintenance():
             cm.schedule_recycling(stalled_tabs[0][0], "stall_tier3", _recycle_browser_standby, cm, router, "stall_tier3")
     elif len(stalled_tabs) == 1:
         url, tab = stalled_tabs[0]
-        stalls = getattr(tab, "consecutive_stalls", 0)
+        with tab.lock:
+            stalls = getattr(tab, "consecutive_stalls", 0)
         if stalls == 0:
             # Tier 1: Soft reload
             m.WS_STALL_ESCALATIONS.labels(url=url, tier="1").inc()
             reload_ok = cm.soft_reload_tab(tab.tab_id)
-            if reload_ok:
-                tab.consecutive_stalls = 1
-                logger.info(f"TabManager: Tier 1 soft reload succeeded for {url}")
-            else:
-                # Reload failed -> escalate directly to Tier 2
-                logger.warning(f"TabManager: Tier 1 soft reload failed for {url}; escalating to Tier 2")
-                m.WS_STALL_ESCALATIONS.labels(url=url, tier="2").inc()
-                tab.consecutive_stalls = 2
+            with tab.lock:
+                if reload_ok:
+                    tab.consecutive_stalls = 1
+                    logger.info(f"TabManager: Tier 1 soft reload succeeded for {url}")
+                else:
+                    # Reload failed -> escalate directly to Tier 2
+                    logger.warning(f"TabManager: Tier 1 soft reload failed for {url}; escalating to Tier 2")
+                    m.WS_STALL_ESCALATIONS.labels(url=url, tier="2").inc()
+                    tab.consecutive_stalls = 2
+            if not reload_ok:
                 cm.schedule_recycling(url, "stall_tier2", _recycle_tab, cm, router, url, "stall_tier2")
         elif stalls == 1:
             # Tier 2: Per-tab recycle
             m.WS_STALL_ESCALATIONS.labels(url=url, tier="2").inc()
-            tab.consecutive_stalls = 2
+            with tab.lock:
+                tab.consecutive_stalls = 2
             logger.warning(f"TabManager: Tier 2 tab recycle triggered for {url}")
             cm.schedule_recycling(url, "stall_tier2", _recycle_tab, cm, router, url, "stall_tier2")
         else:
             # Tier 3: Standby browser recycle (consecutive_stalls >= 2)
             m.WS_STALL_ESCALATIONS.labels(url=url, tier="3").inc()
-            tab.consecutive_stalls += 1
+            with tab.lock:
+                tab.consecutive_stalls += 1
             if now >= _browser_restart_cooldown_until:
                 logger.warning(f"TabManager: Tier 3 standby recycle triggered for {url}")
                 _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
@@ -431,15 +440,16 @@ def _tab_manager_maintenance():
     # 2. Memory-triggered recycling and emergency fallback
     mem = cm.get_memory_usage_gb()
     max_memory_mb = float(os.environ.get("WS_CHROME_MAX_MEMORY_MB", str(WS_CHROME_MAX_MEMORY_MB)))
+    emergency_memory_mb = float(os.environ.get("WS_EMERGENCY_MEMORY_MB", "1400"))
     max_memory_gb = max_memory_mb / 1024.0
+    emergency_memory_gb = emergency_memory_mb / 1024.0
 
-    if mem > 1.6:
-        # Emergency fallback: Fast in-place restart
-        if now >= _browser_restart_cooldown_until:
-            logger.warning(f"TabManager emergency memory {mem:.2f}GB > 1.6GB; performing fast in-place restart")
-            _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
-            _restart_cooldown_until = _browser_restart_cooldown_until
-            cm.schedule_recycling(next(iter(urls), ""), "emergency_memory", _restart_all_tabs, cm, router, "emergency_memory")
+    if mem > emergency_memory_gb:
+        # Emergency fallback: Fast in-place restart (bypasses routine 600s cooldown)
+        logger.warning(f"TabManager EMERGENCY memory {mem:.2f}GB > {emergency_memory_gb:.2f}GB; performing fast in-place restart")
+        _browser_restart_cooldown_until = now + 120.0
+        _restart_cooldown_until = _browser_restart_cooldown_until
+        cm.schedule_recycling(next(iter(urls), ""), "emergency_memory", _restart_all_tabs, cm, router, "emergency_memory")
     elif mem > max_memory_gb:
         # Chrome RSS ceiling: Standby browser zero-drop recycle
         if now >= _browser_restart_cooldown_until:
