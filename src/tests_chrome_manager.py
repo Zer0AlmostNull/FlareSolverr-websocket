@@ -22,6 +22,9 @@ class _FakeTab:
     def add_handler(self, *a, **k):
         self.handlers.append(a)
 
+    async def get(self, *a, **k):
+        return None
+
     async def close(self):
         return None
 
@@ -258,3 +261,217 @@ class TestChromeManager(unittest.TestCase):
         self.assertEqual(fut.result(timeout=5), None)
         self.assertEqual(ran, [1])
         self.assertIsNotNone(mgr._recycle_executor)
+
+    def test_tab_state_frame_classification_and_data_frame_rate(self):
+        tab = TabState(
+            tab_id="tab_1",
+            url="https://mevx.io/?chain=solana",
+            tab=_FakeTab(),
+            target_id="t1",
+        )
+        self.assertEqual(tab.last_data_frame_ts, 0.0)
+        self.assertEqual(tab.last_control_frame_ts, 0.0)
+        self.assertEqual(len(tab.data_frame_history), 0)
+        self.assertEqual(tab.data_frame_rate(60.0), 0.0)
+
+        # 1. Feed data frame (MevX jsonrpc)
+        mevx_data_payload = '{"jsonrpc": "2.0", "id": 1, "result": {"slot": 100}}'
+        tab._handle_frame("webSocketFrameReceived", mevx_data_payload)
+        self.assertGreater(tab.last_data_frame_ts, 0.0)
+        self.assertEqual(tab.last_control_frame_ts, 0.0)
+        self.assertEqual(len(tab.data_frame_history), 1)
+
+        # 2. Feed data frame (MevX subscribeFlashPool)
+        mevx_flash_payload = '{"method": "subscribeFlashPool", "params": {"poolAddress": "0xabc", "createdAt": "2026-08-29"}}'
+        tab._feed("webSocketFrameReceived", mevx_flash_payload)
+        self.assertEqual(len(tab.data_frame_history), 2)
+
+        # 3. Feed control frame (GMGN heartbeat)
+        gmgn_heartbeat_payload = '{"action": "heartbeat"}'
+        tab._handle_frame("webSocketFrameReceived", gmgn_heartbeat_payload)
+        self.assertGreater(tab.last_control_frame_ts, 0.0)
+        # data_frame_history should NOT increment on control frames
+        self.assertEqual(len(tab.data_frame_history), 2)
+
+        # 4. Feed ping string control frame
+        tab._feed("webSocketFrameReceived", "ping")
+        self.assertEqual(len(tab.data_frame_history), 2)
+
+        # 5. Check data frame rate over 60s window
+        rate = tab.data_frame_rate(window_s=60.0)
+        self.assertAlmostEqual(rate, 2.0 / 60.0, places=4)
+
+        # 6. Check data frame rate with window_s <= 0
+        self.assertEqual(tab.data_frame_rate(window_s=0.0), 0.0)
+        self.assertEqual(tab.data_frame_rate(window_s=-5.0), 0.0)
+
+        # 7. Check expired timestamps in history are excluded from rolling calculation
+        tab.data_frame_history.clear()
+        tab.data_frame_history.append(time.time() - 120.0)  # 2 minutes ago
+        self.assertEqual(tab.data_frame_rate(window_s=60.0), 0.0)
+
+    def test_soft_reload_tab_success(self):
+        mgr = self._make_manager()
+        tab = mgr.create_tab("https://mevx.io/?chain=solana")
+        tab.consecutive_stalls = 3
+
+        ok = mgr.soft_reload_tab(tab.tab_id)
+        self.assertTrue(ok)
+        self.assertEqual(tab.status, "running")
+        self.assertEqual(tab.consecutive_stalls, 0)
+
+    def test_soft_reload_tab_failure_sets_status_crashed(self):
+        mgr = self._make_manager()
+        tab = mgr.create_tab("https://mevx.io/?chain=solana")
+        tab.tab.get = mock.AsyncMock(side_effect=RuntimeError("Navigation timeout"))
+
+        ok = mgr.soft_reload_tab(tab.tab_id)
+        self.assertFalse(ok)
+        self.assertEqual(tab.status, "crashed")
+
+    def test_soft_reload_tab_nonexistent_id_returns_false(self):
+        mgr = self._make_manager()
+        ok = mgr.soft_reload_tab("nonexistent_id")
+        self.assertFalse(ok)
+
+    def test_cdp_detached_and_target_crashed_handlers_set_status_crashed(self):
+        import nodriver as uc
+        mgr = self._make_manager()
+        tab = mgr.create_tab("https://mevx.io/?chain=solana")
+        self.assertEqual(tab.status, "running")
+
+        # Find registered Detached and TargetCrashed handlers
+        detached_handler = None
+        target_crashed_handler = None
+        for h in tab.handlers:
+            name = getattr(h, "__name__", "")
+            if name == "on_detached":
+                detached_handler = h
+            elif name == "on_target_crashed":
+                target_crashed_handler = h
+
+        self.assertIsNotNone(detached_handler)
+        self.assertIsNotNone(target_crashed_handler)
+
+        # Trigger Detached handler
+        fake_detached_event = mock.Mock()
+        mgr._loop.run_until_complete(detached_handler(fake_detached_event))
+        self.assertEqual(tab.status, "crashed")
+
+        # Reset and trigger TargetCrashed handler
+        tab.status = "running"
+        fake_crashed_event = mock.Mock()
+        mgr._loop.run_until_complete(target_crashed_handler(fake_crashed_event))
+        self.assertEqual(tab.status, "crashed")
+
+    def test_standby_browser_launch(self):
+        import nodriver as uc
+        import flaresolverr_service as fs
+        mgr = self._make_manager()
+
+        fake_standby_browser = mock.Mock()
+        fake_standby_browser.stop = mock.Mock()
+        fake_standby_browser.get = mock.AsyncMock(return_value=_FakeTab())
+
+        with mock.patch("nodriver.start", mock.AsyncMock(return_value=fake_standby_browser)) as m_start:
+            standby = mgr.launch_standby_browser()
+            self.assertIs(standby, fake_standby_browser)
+            self.assertTrue(m_start.called)
+            # Verify custom flags used for standby browser footprint
+            call_kwargs = m_start.call_args.kwargs
+            self.assertEqual(call_kwargs.get("port"), 0)
+            args = call_kwargs.get("browser_args", [])
+            self.assertIn("--blink-settings=imagesEnabled=false", args)
+            self.assertIn("--window-size=800,600", args)
+            self.assertIn("--js-flags=--max-old-space-size=256", args)
+            self.assertTrue(call_kwargs.get("user_data_dir").startswith("/tmp/tabmgr_standby_") or "tabmgr_standby_" in call_kwargs.get("user_data_dir"))
+
+            # Verify registered with orphan sweeper
+            with fs._shared_dirs_lock:
+                self.assertIn(standby.user_data_dir, fs._shared_browser_dirs)
+
+    def test_standby_warm_tabs_staggered_concurrency(self):
+        mgr = self._make_manager()
+        fake_standby_browser = mock.Mock()
+        fake_standby_browser.get = mock.AsyncMock(return_value=_FakeTab())
+
+        urls = [
+            "https://mevx.io/?chain=solana",
+            "https://mevx.io/?chain=bsc",
+            "https://gmgn.ai/sol",
+        ]
+        warmed = mgr.warm_standby_tabs(fake_standby_browser, urls, concurrency=2, timeout=0.1)
+        self.assertEqual(len(warmed), 3)
+        for u in urls:
+            self.assertIn(u, warmed)
+            self.assertEqual(warmed[u].status, "running")
+            self.assertEqual(warmed[u].url, u)
+
+    def test_standby_swap_browser_and_cleanup(self):
+        from frame_router import FrameRouter
+        import metrics as m
+        import flaresolverr_service as fs
+
+        mgr = self._make_manager(max_tabs=5)
+        router = FrameRouter(mgr)
+
+        url1 = "https://mevx.io/?chain=solana"
+        url2 = "https://gmgn.ai/sol"
+
+        # 1. Establish initial primary tabs on old browser
+        old_tab1 = mgr.create_tab(url1)
+        old_tab2 = mgr.create_tab(url2)
+
+        old_dir = "/tmp/tabmgr_old_standby_test"
+        fs.register_shared_browser_dir(old_dir)
+        mgr._shared_browser_user_data_dir = old_dir
+
+        old_browser_stop_called = []
+        mgr._browser.stop = lambda: old_browser_stop_called.append(True)
+
+        # Feed old frames
+        now = time.time()
+        old_tab1.frame_buffer.append({"timestamp": now, "type": "webSocketFrameReceived", "url": url1, "payload": "old_msg_1", "cdp_ts": 100.0})
+        old_tab2.frame_buffer.append({"timestamp": now, "type": "webSocketFrameReceived", "url": url2, "payload": "old_msg_2", "cdp_ts": 100.0})
+
+        # 2. Create standby browser & warmed tabs
+        standby_browser = mock.Mock()
+        standby_browser.stop = mock.Mock()
+        standby_dir = "/tmp/tabmgr_standby_new"
+        fs.register_shared_browser_dir(standby_dir)
+
+        new_tab1 = TabState(tab_id="standby_t1", url=url1, tab=_FakeTab(), target_id="st1", status="running")
+        new_tab2 = TabState(tab_id="standby_t2", url=url2, tab=_FakeTab(), target_id="st2", status="running")
+        # Standby tab receives a overlapping duplicate and a new message
+        new_tab1.frame_buffer.append({"timestamp": now + 0.1, "type": "webSocketFrameReceived", "url": url1, "payload": "old_msg_1", "cdp_ts": 1.0})
+        new_tab1.frame_buffer.append({"timestamp": now + 0.5, "type": "webSocketFrameReceived", "url": url1, "payload": "new_msg_standby", "cdp_ts": 1.5})
+
+        warmed_tabs = {url1: new_tab1, url2: new_tab2}
+
+        # 3. Swap standby browser
+        mgr.swap_standby_browser(standby_browser, standby_dir, warmed_tabs, router, quiescence_s=0.0)
+
+        # 4. Verify primary swapped via CAS
+        self.assertEqual(mgr._url_index[url1], "standby_t1")
+        self.assertEqual(mgr._url_index[url2], "standby_t2")
+
+        # 5. Verify buffer merge and cross-process deduplication
+        drained1 = mgr.drain_tab(url1)
+        payloads1 = [f["payload"] for f in drained1]
+        self.assertEqual(payloads1, ["old_msg_1", "new_msg_standby"])
+
+        # 6. Verify old tabs removed from _tabs registry
+        self.assertNotIn(old_tab1.tab_id, mgr._tabs)
+        self.assertNotIn(old_tab2.tab_id, mgr._tabs)
+        self.assertIn("standby_t1", mgr._tabs)
+        self.assertIn("standby_t2", mgr._tabs)
+
+        # 7. Verify old browser stopped and old user_data_dir unregistered
+        self.assertEqual(old_browser_stop_called, [True])
+        with fs._shared_dirs_lock:
+            self.assertNotIn(old_dir, fs._shared_browser_dirs)
+            self.assertIn(standby_dir, fs._shared_browser_dirs)
+
+        # 8. Verify browser promoted
+        self.assertIs(mgr._browser, standby_browser)
+        self.assertEqual(mgr._shared_browser_user_data_dir, standby_dir)

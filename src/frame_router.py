@@ -1,8 +1,9 @@
+import hashlib
 import json
 import logging
 import threading
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import metrics as m
 
@@ -12,6 +13,11 @@ logger = logging.getLogger(__name__)
 # MonotonicTime, so the same WS frame delivered to old+new tab carries near-equal
 # cdp_ts. Wall-clock (time.time()) is NOT shared and must not be used for identity.
 CDP_OVERLAP_WINDOW_S = 2.0
+
+# Cross-process "same message" window. Dual-Chrome instances have distinct CDP
+# monotonic base times, so cross-process deduplication uses wall-clock arrival
+# timestamps (time.time()).
+CROSS_PROCESS_OVERLAP_WINDOW_S = 3.0
 
 # Domain-independent marker for "payload has no per-message unique field".
 _NO_KEY = object()
@@ -26,34 +32,166 @@ def _try_json(payload: str):
         return None
 
 
-def _msg_key_from_json(url: str, obj) -> str:
-    """Extract a per-message unique key by parsing the payload JSON, branching
-    on the message envelope so we never rely on repetition-prone snapshot fields.
+def extract_semantic_messages(payload: str) -> List[Tuple[str, str, bool]]:
+    """Granular protocol-aware batch unpacking & semantic message extraction.
 
-    Domain/URL is read from the frame's url so the same extractor works for any
-    site. Returns _NO_KEY when no reliable per-message field exists (caller then
-    falls back to byte-identical payload + CDP-ts proximity)."""
+    Returns a list of (key, normalized_payload, is_data) tuples:
+      - key: Domain-level unique message identifier (or normalized payload for keyless).
+      - normalized_payload: Normalized string representation of the semantic message.
+      - is_data: True for trade/pool data; False for control/heartbeat/ping frames.
+    """
+    if not isinstance(payload, str) or not payload.strip():
+        return []
+
+    lines = [line.strip() for line in payload.split("\n") if line.strip()]
+    if not lines:
+        return []
+
+    results: List[Tuple[str, str, bool]] = []
+
+    for line in lines:
+        obj = _try_json(line)
+        if obj is None:
+            # Fallback / non-JSON string
+            is_ping_pong = line.lower() in ("ping", "pong", "2", "3")
+            results.append((line, line, not is_ping_pong))
+            continue
+
+        if isinstance(obj, dict):
+            # ---- 1. MevX / JSON-RPC ----
+            # subscribeFlashPool notification
+            if obj.get("method") == "subscribeFlashPool":
+                params = obj.get("params") or {}
+                pool = params.get("poolAddress", "")
+                created = params.get("createdAt", "")
+                h = hashlib.sha256(line.encode("utf-8")).hexdigest()[:8]
+                key = f"flash:{pool}:{created}:{h}"
+                results.append((key, line, True))
+                continue
+
+            # JSON-RPC requests/responses with 'id'
+            if obj.get("jsonrpc") == "2.0" and obj.get("id") is not None:
+                msg_id = obj["id"]
+                key = f"jsonrpc:id:{msg_id}"
+                is_ping_pong = (
+                    obj.get("method") in ("ping", "pong")
+                    or obj.get("result") in ("pong", "ping", "PONG", "PING")
+                )
+                results.append((key, line, not is_ping_pong))
+                continue
+
+            # ---- 2. GMGN Protocol ----
+            action = obj.get("action")
+            if action in ("heartbeat", "ping", "pong"):
+                key = f"gmgn:heartbeat:{action}"
+                results.append((key, line, False))
+                continue
+
+            if obj.get("ping") is not None:
+                results.append((f"gmgn:ping:{obj['ping']}", line, False))
+                continue
+            if obj.get("pong") is not None:
+                results.append((f"gmgn:pong:{obj['pong']}", line, False))
+                continue
+
+            t = obj.get("t")
+            channel = obj.get("channel")
+
+            if channel in ("major_coin_price", "coin_price") or t in ("coin_price", "major_coin_price"):
+                results.append(("gmgn:major_coin_price", line, False))
+                continue
+
+            if channel == "chain_stat" or t == "chain_stat":
+                results.append(("gmgn:chain_stat", line, False))
+                continue
+
+            # public_broadcast array decomposition
+            if channel == "public_broadcast":
+                data = obj.get("data")
+                if isinstance(data, list) and len(data) > 0:
+                    for item in data:
+                        if isinstance(item, dict):
+                            ed = item.get("ed") if isinstance(item.get("ed"), dict) else {}
+                            sig_id = ed.get("sig_id")
+                            tw_id = ed.get("id") if item.get("et") == "twitter_watched" else None
+                            if sig_id is not None:
+                                key = f"gmgn:sig:{sig_id}"
+                            elif tw_id is not None:
+                                key = f"gmgn:tw:{tw_id}"
+                            else:
+                                item_json = json.dumps(item, separators=(',', ':'))
+                                key = f"gmgn:item:{hashlib.sha256(item_json.encode('utf-8')).hexdigest()[:8]}"
+                            norm_item = json.dumps(item, separators=(',', ':'))
+                            results.append((key, norm_item, True))
+                        else:
+                            results.append((f"gmgn:raw:{item}", str(item), True))
+                elif isinstance(data, list) and len(data) == 0:
+                    results.append(("gmgn:public_broadcast:empty", line, False))
+                else:
+                    results.append((line, line, True))
+                continue
+
+            # callout_global
+            if t == "callout_global" or channel == "callout_global":
+                data = obj.get("data")
+                uids = []
+                if isinstance(data, list):
+                    uids = [str(d.get("uid")) for d in data if isinstance(d, dict) and d.get("uid") is not None]
+                key = f"gmgn:callout:{':'.join(uids)}" if uids else "gmgn:callout"
+                results.append((key, line, True))
+                continue
+
+            # route_info
+            if t == "route_info" or channel == "route_info":
+                d = obj.get("d")
+                counter = ""
+                if isinstance(d, dict) and d:
+                    counter = str(next(iter(d.values())))
+                key = f"gmgn:route:{counter}" if counter else "gmgn:route"
+                results.append((key, line, False))
+                continue
+
+            # Other GMGN channels (e.g. token_social_info) -> data frame
+            if channel:
+                key = f"gmgn:{channel}"
+                results.append((key, line, True))
+                continue
+
+            # Fallback dict
+            is_ping_pong = obj.get("method") in ("ping", "pong") or obj.get("result") in ("pong", "ping")
+            results.append((line, line, not is_ping_pong))
+            continue
+
+        elif isinstance(obj, list):
+            for sub_obj in obj:
+                sub_str = json.dumps(sub_obj, separators=(',', ':'))
+                sub_extracted = extract_semantic_messages(sub_str)
+                results.extend(sub_extracted)
+            continue
+
+        else:
+            results.append((line, line, True))
+
+    return results
+
+
+def _msg_key_from_json(url: str, obj) -> str:
+    """Legacy helper preserved for backward compatibility."""
     if not isinstance(obj, dict):
         return _NO_KEY
 
-    # ---- JSON-RPC (mevx.io): an 'id' UUID on responses/pongs is unique ----
     if obj.get("jsonrpc") == "2.0" and obj.get("id") is not None:
         return f"jsonrpc:id:{obj['id']}"
 
-    # ---- mevx.io 'subscribeFlashPool' notification: snapshot, no id ----
-    # Key = method + poolAddress + createdAt (stable per token). We only treat
-    # two frames as "same" when these match AND cdp_ts is within the window AND
-    # payloads are byte-identical (handled by caller). This never invents an id
-    # and never collapses distinct tokens.
     if obj.get("method"):
         params = obj.get("params")
         if isinstance(params, dict):
             pool = params.get("poolAddress")
             created = params.get("createdAt")
             if pool is not None and created is not None:
-                return f"flash:{obj['method']}:{pool}:{created}"
+                h = hashlib.sha256(json.dumps(obj).encode("utf-8")).hexdigest()[:8]
+                return f"flash:{pool}:{created}:{h}"
 
-    # ---- gmgn.ai channel envelopes ----
     channel = obj.get("channel")
     if channel == "public_broadcast":
         for item in (obj.get("data") or []):
@@ -73,7 +211,6 @@ def _msg_key_from_json(url: str, obj) -> str:
     if obj.get("t") == "route_info":
         d = obj.get("d")
         if isinstance(d, dict) and d:
-            # value embeds a ms:seq monotonic counter -> unique-ish
             k = next(iter(d.values()), None)
             if k is not None:
                 return f"gmgn:route:{k}"
@@ -82,34 +219,71 @@ def _msg_key_from_json(url: str, obj) -> str:
 
 
 def _message_key(frame: dict):
-    """Best-effort unique key for a frame, or None if only payload matters."""
-    url = frame.get("url", "")
+    """Best-effort unique key for a frame, or tuple of keys for batch messages."""
     payload = frame.get("payload", "")
-    obj = _try_json(payload)
-    if obj is not None:
-        k = _msg_key_from_json(url, obj)
-        if k is not _NO_KEY:
-            return (k, payload)   # strong key: field-level (payload as tie-break)
-    return (payload,)             # weak key: byte-identical payload only
+    extracted = extract_semantic_messages(payload)
+    if not extracted:
+        return (payload,)
+    if len(extracted) == 1:
+        return (extracted[0][0],)
+    return tuple(m[0] for m in extracted)
 
 
 def _same_message(a: dict, b: dict) -> bool:
-    """True if a and b are the SAME underlying WS message (duplicate)."""
+    """True if a and b are the SAME underlying WS message (intra-process duplicate)."""
     ka, kb = _message_key(a), _message_key(b)
     if ka != kb:
         return False
-    # Strong keys must also be CDP-temporally close to count as the SAME frame.
     ca, cb = a.get("cdp_ts"), b.get("cdp_ts")
     if ca is not None and cb is not None:
         if abs(ca - cb) <= CDP_OVERLAP_WINDOW_S:
             return True
         return False
-    # CDP ts missing on at least one side (unit tests or partial capture).
-    # NEVER collapse based on payload alone without CDP proximity —
-    # identical payloads can be distinct messages (e.g. repeated coin_price ticks).
-    # Return False to keep both frames (zero-drop); caller's merge logic
-    # will dedup only when CDP timestamps are available.
     return False
+
+
+def _same_message_cross_process(a: dict, b: dict) -> bool:
+    """True if a and b are the SAME underlying WS message (cross-process duplicate).
+
+    Dual-Chrome instances have distinct CDP monotonic clocks, so cross-process
+    deduplication compares extracted semantic keys (or payload equality for keyless)
+    combined with wall-clock arrival timestamp proximity (<= 3.0s).
+    """
+    ka, kb = _message_key(a), _message_key(b)
+    if ka != kb:
+        return False
+    ta, tb = a.get("timestamp"), b.get("timestamp")
+    if ta is not None and tb is not None:
+        if abs(ta - tb) <= CROSS_PROCESS_OVERLAP_WINDOW_S:
+            return True
+        return False
+    return False
+
+
+def _merge_dedup(old_frames, new_frames, maxlen=2000, cross_process=False):
+    """Merge old+new preserving order, dropping NEW frames that duplicate an
+    OLD frame (or prior new frame). Dedup via _same_message (intra-process,
+    CDP monotonic proximity <= 2.0s) or _same_message_cross_process (cross-process,
+    wall-clock arrival proximity <= 3.0s).
+    Returns merged list trimmed to maxlen (keeping newest frames).
+
+    Zero-drop guarantee: old unique frames are NEVER evicted to make room for
+    new frames that turn out to be duplicates. Dedup first (dropping only
+    genuine duplicates), then trim the merged result to maxlen only if it
+    still exceeds the cap (which requires genuinely-new frames)."""
+    same_fn = _same_message_cross_process if cross_process else _same_message
+    result = list(old_frames)
+    seen = {_message_key(f): f for f in old_frames}
+    for f in new_frames:
+        k = _message_key(f)
+        prior = seen.get(k)
+        if prior is not None and same_fn(prior, f):
+            continue          # duplicate of a prior frame -> drop
+        seen[k] = f
+        result.append(f)
+    if len(result) > maxlen:
+        result = result[-maxlen:]
+    return result
 
 
 class FrameRouter:
@@ -146,32 +320,15 @@ class FrameRouter:
             return "unhealthy"  # tab exists but being replaced = stale
         return "failed"
 
-    def _merge_dedup(self, old_frames, new_frames, maxlen=2000):
+    def _merge_dedup(self, old_frames, new_frames, maxlen=2000, cross_process=False):
         """Merge old+new preserving order, dropping NEW frames that duplicate an
-        OLD frame (the shadow re-delivers the tail of the old stream). Dedup via
-        _same_message: field-level key when available, else payload+CDP window.
-        Returns merged list trimmed to maxlen (keeping newest frames).
+        OLD frame (or prior new frame). Dedup via _same_message (intra-process,
+        CDP monotonic proximity <= 2.0s) or _same_message_cross_process (cross-process,
+        wall-clock arrival proximity <= 3.0s).
+        Returns merged list trimmed to maxlen (keeping newest frames)."""
+        return _merge_dedup(old_frames, new_frames, maxlen=maxlen, cross_process=cross_process)
 
-        Zero-drop guarantee: old unique frames are NEVER evicted to make room for
-        new frames that turn out to be duplicates. Dedup first (dropping only
-        genuine duplicates), then trim the merged result to maxlen only if it
-        still exceeds the cap (which requires genuinely-new frames)."""
-        result = list(old_frames)
-        seen = {_message_key(f): f for f in old_frames}
-        for f in new_frames:
-            k = _message_key(f)
-            prior = seen.get(k)
-            if prior is not None and _same_message(prior, f):
-                continue          # duplicate of an old frame -> drop
-            seen[k] = f
-            result.append(f)
-        # Final trim to the hard cap (maxlen is a bounded buffer); only reached
-        # when genuinely-new frames pushed the total past the cap.
-        if len(result) > maxlen:
-            result = result[-maxlen:]
-        return result
-
-    def handoff(self, url: str, old_tab, new_tab):
+    def handoff(self, url: str, old_tab, new_tab, cross_process: bool = False):
         """Zero-drop handoff: promote new_tab to primary, merge buffers without loss.
 
         Returns "success" after a normal handoff, or "stale" if a concurrent
@@ -217,7 +374,7 @@ class FrameRouter:
                     # payload + CDP-ts/clock proximity. Order of old is preserved
                     # then new. Trim to new tab's buffer maxlen to avoid silent eviction.
                     maxlen = getattr(new_tab.frame_buffer, "maxlen", 2000)
-                    result = self._merge_dedup(old_frames, new_frames, maxlen=maxlen)
+                    result = self._merge_dedup(old_frames, new_frames, maxlen=maxlen, cross_process=cross_process)
 
                     new_tab.frame_buffer.extend(result)
                     new_tab.status = "running"
@@ -245,6 +402,7 @@ class FrameRouter:
                     merged = self._merge_dedup(
                         existing, tail,
                         maxlen=getattr(new_tab.frame_buffer, "maxlen", 2000),
+                        cross_process=cross_process,
                     )
                     new_tab.frame_buffer.clear()
                     new_tab.frame_buffer.extend(merged)

@@ -1,15 +1,16 @@
 import asyncio
 import logging
+import os
+import shutil
+import tempfile
 import threading
 import time
-import os
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, List
 from uuid import uuid4
-import tempfile
 
 import nodriver as uc
 
@@ -37,7 +38,6 @@ async def _launch_browser():
     user_data_dir = tempfile.mkdtemp(prefix="tabmgr_")
     # SECURITY FIX 1: sandbox=True by default; allow override via WS_CHROME_SANDBOX env var
     # (default true). Only disable if Cloudflare validation proves it blocks.
-    import os
     sandbox = os.environ.get('WS_CHROME_SANDBOX', 'true').lower() == 'true'
     browser = await uc.start(
         headless=headless,
@@ -61,6 +61,44 @@ async def _launch_browser():
     return browser
 
 
+async def _launch_standby_browser():
+    """Launch an isolated standby nodriver Chrome with optimized footprint.
+    MUST be called on the ChromeManager event loop (async)."""
+    headless = utils.get_config_headless()
+    if not headless:
+        utils.start_xvfb_display()
+    user_data_dir = tempfile.mkdtemp(prefix="tabmgr_standby_")
+    sandbox = os.environ.get('WS_CHROME_SANDBOX', 'true').lower() == 'true'
+    browser = await uc.start(
+        headless=headless,
+        sandbox=sandbox,
+        user_data_dir=user_data_dir,
+        port=0,
+        browser_args=[
+            "--no-first-run",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--blink-settings=imagesEnabled=false",
+            "--window-size=800,600",
+            "--js-flags=--max-old-space-size=256",
+            "--site-per-process",
+            "--enable-features=IsolateOrigins,site-per-process",
+        ],
+    )
+    browser.user_data_dir = user_data_dir
+    try:
+        import flaresolverr_service as fs
+        fs.register_shared_browser_dir(user_data_dir)
+    except Exception as e:
+        logger.warning(f"Failed to register standby browser dir: {e}")
+    return browser
+
+
+async def launch_standby_browser():
+    """Top-level coroutine to launch a standby browser."""
+    return await _launch_standby_browser()
+
+
 @dataclass
 class TabState:
     tab_id: str
@@ -70,9 +108,70 @@ class TabState:
     frame_buffer: deque = field(default_factory=lambda: deque(maxlen=utils.get_config_ws_listener_default_max_msgs()))
     lock: threading.Lock = field(default_factory=threading.Lock)
     last_frame_ts: float = field(default_factory=time.time)
-    status: str = "starting"             # starting | running | warming | handoff | retiring
+    status: str = "starting"             # starting | running | warming | handoff | retiring | crashed | reloading
     service_started_at: datetime = field(default_factory=datetime.now)
     handlers: list = field(default_factory=list)   # registered CDP handler refs
+    last_data_frame_ts: float = 0.0
+    last_control_frame_ts: float = 0.0
+    consecutive_stalls: int = 0
+    data_frame_history: deque = field(default_factory=lambda: deque(maxlen=1000))
+    control_frame_history: deque = field(default_factory=lambda: deque(maxlen=1000))
+
+    def data_frame_rate(self, window_s: float = 60.0) -> float:
+        """Calculate rolling data frames per second over the specified window."""
+        if window_s <= 0:
+            return 0.0
+        now = time.time()
+        cutoff = now - window_s
+        with self.lock:
+            if not self.data_frame_history:
+                return 0.0
+            count = sum(1 for ts in self.data_frame_history if ts >= cutoff)
+        return count / window_s
+
+    def control_frame_rate(self, window_s: float = 60.0) -> float:
+        """Calculate rolling control/ping frames per second over the specified window."""
+        if window_s <= 0:
+            return 0.0
+        now = time.time()
+        cutoff = now - window_s
+        with self.lock:
+            if not self.control_frame_history:
+                return 0.0
+            count = sum(1 for ts in self.control_frame_history if ts >= cutoff)
+        return count / window_s
+
+    def _handle_frame(self, frame_type: str, payload: str, cdp_ts=None):
+        MAX_FRAME_SIZE = 1_000_000
+        if len(payload) > MAX_FRAME_SIZE:
+            logger.warning(f"Dropping oversized WS frame ({len(payload)} bytes) for {self.url}")
+            return
+
+        from frame_router import extract_semantic_messages
+        semantic_msgs = extract_semantic_messages(payload)
+        is_data = any(m[2] for m in semantic_msgs) if semantic_msgs else False
+
+        now = time.time()
+        msg = {
+            "timestamp": now,
+            "type": frame_type,                      # "webSocketFrameReceived" | "webSocketFrameSent"
+            "url": self.url,
+            "payload": payload,
+            "cdp_ts": cdp_ts,                        # CDP MonotonicTime; INTERNAL
+        }
+        with self.lock:
+            self.frame_buffer.append(msg)
+            self.last_frame_ts = now
+            if is_data:
+                self.last_data_frame_ts = now
+                self.data_frame_history.append(now)
+                self.consecutive_stalls = 0
+            else:
+                self.last_control_frame_ts = now
+                self.control_frame_history.append(now)
+
+    def _feed(self, frame_type: str, payload: str, cdp_ts=None):
+        self._handle_frame(frame_type, payload, cdp_ts=cdp_ts)
 
 
 class ChromeManager:
@@ -129,6 +228,11 @@ class ChromeManager:
     async def _async_attach_cdp(self, tab_state: TabState):
         tab = tab_state.tab
         await tab.send(uc.cdp.network.enable())
+        try:
+            if hasattr(uc.cdp, "inspector") and hasattr(uc.cdp.inspector, "enable"):
+                await tab.send(uc.cdp.inspector.enable())
+        except Exception as e:
+            logger.debug(f"Could not enable inspector domain: {e}")
 
         async def on_received(event: uc.cdp.network.WebSocketFrameReceived):
             # event.timestamp is the CDP MonotonicTime, shared by ALL tabs in
@@ -152,9 +256,56 @@ class ChromeManager:
                 logger.error(f"CDP on_sent handler error: {e}")
                 return
 
+        async def on_detached(event: uc.cdp.inspector.Detached):
+            logger.warning(f"CDP Inspector detached for tab {tab_state.tab_id} ({tab_state.url}): {event}")
+            tab_state.status = "crashed"
+
+        async def on_target_crashed(event: uc.cdp.target.TargetCrashed):
+            logger.warning(f"CDP Target crashed for tab {tab_state.tab_id} ({tab_state.url}): {event}")
+            tab_state.status = "crashed"
+
         tab.add_handler(uc.cdp.network.WebSocketFrameReceived, on_received)
         tab.add_handler(uc.cdp.network.WebSocketFrameSent, on_sent)
-        tab_state.handlers = [on_received, on_sent]
+        handlers = [on_received, on_sent]
+
+        if hasattr(uc.cdp, "inspector") and hasattr(uc.cdp.inspector, "Detached"):
+            tab.add_handler(uc.cdp.inspector.Detached, on_detached)
+            handlers.append(on_detached)
+
+        if hasattr(uc.cdp, "target") and hasattr(uc.cdp.target, "TargetCrashed"):
+            tab.add_handler(uc.cdp.target.TargetCrashed, on_target_crashed)
+            handlers.append(on_target_crashed)
+
+        if hasattr(uc.cdp, "inspector") and hasattr(uc.cdp.inspector, "TargetCrashed"):
+            tab.add_handler(uc.cdp.inspector.TargetCrashed, on_target_crashed)
+
+        tab_state.handlers = handlers
+
+    async def _async_soft_reload_tab(self, tab_id: str) -> bool:
+        with self._lock:
+            tab_state = self._tabs.get(tab_id)
+        if not tab_state:
+            logger.warning(f"ChromeManager: soft reload failed - tab {tab_id} not found")
+            return False
+
+        tab_state.status = "reloading"
+        try:
+            tab = tab_state.tab
+            await asyncio.wait_for(tab.get(tab_state.url), timeout=10.0)
+            await tab.send(uc.cdp.network.enable())
+            try:
+                if hasattr(uc.cdp, "inspector") and hasattr(uc.cdp.inspector, "enable"):
+                    await tab.send(uc.cdp.inspector.enable())
+            except Exception:
+                pass
+            tab_state.status = "running"
+            tab_state.consecutive_stalls = 0
+            logger.info(f"ChromeManager: soft reload succeeded for tab {tab_id} ({tab_state.url})")
+            return True
+        except Exception as e:
+            logger.warning(f"ChromeManager: soft reload failed for tab {tab_id} ({tab_state.url}): {e}")
+            tab_state.status = "crashed"
+            return False
 
     async def _async_close_tab(self, tab_state: TabState):
         try:
@@ -611,24 +762,203 @@ class ChromeManager:
             pass
         return 0.0
 
+    def soft_reload_tab(self, tab_id: str, timeout: float = 30.0) -> bool:
+        """Synchronously perform a Tier 1 soft reload for the tab."""
+        try:
+            return self._call(self._async_soft_reload_tab(tab_id), timeout=timeout)
+        except Exception as e:
+            logger.error(f"ChromeManager: soft_reload_tab failed for {tab_id}: {e}")
+            with self._lock:
+                tab_state = self._tabs.get(tab_id)
+                if tab_state:
+                    tab_state.status = "crashed"
+            return False
 
-# TabState._feed: thread-safe frame append (called from asyncio thread)
-def _tab_feed(self, frame_type: str, payload: str, cdp_ts=None):
-    # SECURITY FIX 3: max frame size guard (1MB)
-    MAX_FRAME_SIZE = 1_000_000
-    if len(payload) > MAX_FRAME_SIZE:
-        logger.warning(f"Dropping oversized WS frame ({len(payload)} bytes) for {self.url}")
-        return
-    msg = {
-        "timestamp": time.time(),
-        "type": frame_type,                      # "webSocketFrameReceived" | "webSocketFrameSent"
-        "url": self.url,
-        "payload": payload,
-        "cdp_ts": cdp_ts,                        # CDP MonotonicTime; INTERNAL (stripped before /websocket_messages return)
-    }
-    with self.lock:
-        self.frame_buffer.append(msg)
-        self.last_frame_ts = time.time()
+    async def _async_launch_standby_browser(self):
+        return await _launch_standby_browser()
+
+    def launch_standby_browser(self, timeout: float = 60.0):
+        """Launch an isolated standby Chrome browser instance."""
+        return self._call(self._async_launch_standby_browser(), timeout=timeout)
+
+    async def _async_warm_standby_tabs(self, standby_browser, urls: List[str], concurrency: int = 2, timeout: float = 60.0) -> Dict[str, TabState]:
+        warmed_tabs: Dict[str, TabState] = {}
+        concurrency = max(1, concurrency)
+
+        async def _warm_tab_internal(url: str) -> TabState:
+            tab = await standby_browser.get(url)
+            tab_id = f"tab_standby_{uuid4().hex}"
+            tab_state = TabState(
+                tab_id=tab_id,
+                url=url,
+                tab=tab,
+                target_id=getattr(tab, "target_id", ""),
+                status="warming",
+            )
+            await self._async_attach_cdp(tab_state)
+            start_ts = time.time()
+            tab_timeout = min(timeout, 15.0)
+            while time.time() - start_ts < tab_timeout:
+                with tab_state.lock:
+                    has_frame = tab_state.last_data_frame_ts > 0 or bool(tab_state.frame_buffer)
+                if has_frame:
+                    break
+                await asyncio.sleep(0.1)
+            tab_state.status = "running"
+            return tab_state
+
+        for i in range(0, len(urls), concurrency):
+            batch = urls[i:i + concurrency]
+            results = await asyncio.gather(*[_warm_tab_internal(u) for u in batch], return_exceptions=False)
+            for ts in results:
+                warmed_tabs[ts.url] = ts
+
+        return warmed_tabs
+
+    def warm_standby_tabs(self, standby_browser, urls: List[str], concurrency: int = 2, timeout: float = 60.0) -> Dict[str, TabState]:
+        """Synchronously warm tabs in standby browser in batches."""
+        return self._call(self._async_warm_standby_tabs(standby_browser, urls, concurrency=concurrency, timeout=timeout), timeout=timeout + 60.0)
+
+    def swap_standby_browser(self, standby_browser, standby_user_data_dir: Optional[str], new_tabs: Dict[str, TabState], router, quiescence_s: float = 2.0):
+        """Atomically promote standby browser to primary with zero-drop cross-process merge."""
+        start_time = time.time()
+        new_tabs_by_url: Dict[str, TabState] = {}
+        for val in new_tabs.values():
+            if isinstance(val, TabState):
+                new_tabs_by_url[val.url] = val
+
+        old_tabs_to_retire = []
+        with self._lock:
+            for ts in new_tabs_by_url.values():
+                self._tabs[ts.tab_id] = ts
+
+            for url, old_tab_id in list(self._url_index.items()):
+                new_tab = new_tabs_by_url.get(url)
+                if not new_tab:
+                    continue
+                old_tab = self._tabs.get(old_tab_id)
+                if not old_tab:
+                    continue
+                swapped = self.swap_primary(url, old_tab_id, new_tab.tab_id)
+                if swapped:
+                    old_tabs_to_retire.append((url, old_tab, new_tab))
+
+            # If there are URLs in new_tabs not in _url_index, register them as primaries
+            for url, ts in new_tabs_by_url.items():
+                if url not in self._url_index:
+                    self._url_index[url] = ts.tab_id
+
+        # Perform cross-process buffer merge & dedup
+        for url, old_tab, new_tab in old_tabs_to_retire:
+            with old_tab.lock:
+                with new_tab.lock:
+                    old_frames = list(old_tab.frame_buffer)
+                    new_frames = list(new_tab.frame_buffer)
+                    old_tab.frame_buffer.clear()
+                    new_tab.frame_buffer.clear()
+
+                    maxlen = getattr(new_tab.frame_buffer, "maxlen", 2000)
+                    merged = router._merge_dedup(old_frames, new_frames, maxlen=maxlen, cross_process=True)
+                    new_tab.frame_buffer.extend(merged)
+                    new_tab.status = "running"
+                    old_tab.status = "retiring"
+
+        # Quiescence window to drain tail frames from old browser tabs
+        if quiescence_s > 0:
+            time.sleep(quiescence_s)
+
+        for url, old_tab, new_tab in old_tabs_to_retire:
+            tail = []
+            with old_tab.lock:
+                if old_tab.frame_buffer:
+                    tail = list(old_tab.frame_buffer)
+                    old_tab.frame_buffer.clear()
+            if tail:
+                with new_tab.lock:
+                    existing = list(new_tab.frame_buffer)
+                    merged = router._merge_dedup(existing, tail, maxlen=getattr(new_tab.frame_buffer, "maxlen", 2000), cross_process=True)
+                    new_tab.frame_buffer.clear()
+                    new_tab.frame_buffer.extend(merged)
+
+        # Remove old tabs from registry
+        with self._lock:
+            for _, old_tab, _ in old_tabs_to_retire:
+                self._tabs.pop(old_tab.tab_id, None)
+
+        # Clean up old browser process & profile
+        old_browser = self._browser
+        old_user_data_dir = getattr(self, "_shared_browser_user_data_dir", None)
+        if old_browser is not None:
+            try:
+                stop = getattr(old_browser, "stop", None)
+                if callable(stop):
+                    stop()
+            except Exception as e:
+                logger.warning(f"ChromeManager: old browser stop error: {e}")
+
+        if old_user_data_dir:
+            try:
+                import flaresolverr_service as fs
+                fs.unregister_shared_browser_dir(old_user_data_dir)
+            except Exception as e:
+                logger.warning(f"ChromeManager: error unregistering old shared dir: {e}")
+            try:
+                if os.path.exists(old_user_data_dir):
+                    shutil.rmtree(old_user_data_dir, ignore_errors=True)
+            except Exception as e:
+                logger.warning(f"ChromeManager: error removing old user_data_dir: {e}")
+
+        # Promote standby browser
+        self._browser = standby_browser
+        self._shared_browser_user_data_dir = standby_user_data_dir or getattr(standby_browser, "user_data_dir", None)
+
+        # Metrics & gauges
+        duration = time.time() - start_time
+        m.WS_STANDBY_HANDOFF_DURATION.observe(duration)
+        self._recompute_ws_gauges()
+
+    def recycle_browser_standby(self, router, reason: str = "scheduled", quiescence_s: float = 2.0) -> bool:
+        """Synchronously execute full standby browser swap: launch, warm, swap, and cleanup."""
+        if not self._restart_lock.acquire(blocking=False):
+            logger.info("ChromeManager: recycle_browser_standby skipped (restart/recover in progress)")
+            return False
+        try:
+            logger.info(f"ChromeManager: starting standby browser recycle (reason={reason})")
+            with self._lock:
+                urls = list(self._url_index.keys())
+            if not urls:
+                logger.info("ChromeManager: no active tabs to migrate to standby browser")
+                return False
+            standby_browser = self.launch_standby_browser()
+            standby_dir = getattr(standby_browser, "user_data_dir", None)
+            new_tabs = self.warm_standby_tabs(standby_browser, urls)
+            self.swap_standby_browser(standby_browser, standby_dir, new_tabs, router, quiescence_s=quiescence_s)
+            logger.info(f"ChromeManager: standby browser recycle completed (reason={reason})")
+            return True
+        except Exception as e:
+            logger.error(f"ChromeManager: standby browser recycle failed: {e}")
+            raise
+        finally:
+            self._restart_lock.release()
 
 
-TabState._feed = _tab_feed
+async def warm_standby_tabs(standby_browser, urls: List[str], concurrency: int = 2, timeout: float = 60.0, chrome_manager=None) -> Dict[str, TabState]:
+    """Top-level function for warming standby tabs."""
+    cm = chrome_manager or ChromeManager()
+    return await cm._async_warm_standby_tabs(standby_browser, urls, concurrency=concurrency, timeout=timeout)
+
+
+def swap_standby_browser(standby_browser, standby_user_data_dir, new_tabs: Dict[str, TabState], router, chrome_manager=None, quiescence_s: float = 2.0):
+    """Top-level function for swapping standby browser."""
+    cm = chrome_manager or getattr(router, "mgr", None)
+    if cm is None:
+        raise ValueError("chrome_manager required for swap_standby_browser")
+    return cm.swap_standby_browser(standby_browser, standby_user_data_dir, new_tabs, router, quiescence_s=quiescence_s)
+
+
+def recycle_browser_standby(router, reason: str = "scheduled", chrome_manager=None, quiescence_s: float = 2.0):
+    """Top-level function for recycling browser using standby instance."""
+    cm = chrome_manager or getattr(router, "mgr", None)
+    if cm is None:
+        raise ValueError("chrome_manager required for recycle_browser_standby")
+    return cm.recycle_browser_standby(router, reason=reason, quiescence_s=quiescence_s)

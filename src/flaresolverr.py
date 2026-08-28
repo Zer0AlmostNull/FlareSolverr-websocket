@@ -56,6 +56,13 @@ _recycle_cooldown_until: dict = {}
 STALE_RESTART_WINDOW_S = 120.0
 BROWSER_RESTART_COOLDOWN_S = 600.0
 _browser_restart_cooldown_until = 0.0
+_restart_cooldown_until = 0.0
+
+WS_DATA_STALL_TIMEOUT_S = 60.0
+GMGN_GRACE_PERIOD_S = 180.0
+WS_CHROME_RECYCLE_INTERVAL_HOURS = 6.0
+WS_CHROME_MAX_MEMORY_MB = 1200
+_last_periodic_recycle_time = time.time()
 
 
 def _manager_broken(cm) -> bool:
@@ -295,57 +302,165 @@ def _restart_all_tabs(cm, router, reason):
         m.WS_TAB_RESTART_TOTAL.labels(reason=f"{reason}_failed").inc()
 
 
+def _recycle_browser_standby(cm_or_reason, router=None, reason: str = "scheduled"):
+    """Recycle shared Chrome using isolated standby browser with zero-drop handoff."""
+    import metrics as m
+    global _browser_restart_cooldown_until, _restart_cooldown_until
+    if router is None and isinstance(cm_or_reason, str):
+        reason = cm_or_reason
+        cm = _tab_mgr["cm"]
+        router = _tab_mgr["router"]
+    else:
+        cm = cm_or_reason
+    if cm is None or router is None:
+        logger.warning("TabManager: _recycle_browser_standby skipped (cm or router is None)")
+        return
+    try:
+        logger.warning(f"TabManager: standby browser recycle triggered ({reason})")
+        cm.recycle_browser_standby(router, reason=reason)
+        m.WS_STANDBY_BROWSER_RECYCLES.labels(reason=reason).inc()
+        now = time.time()
+        _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
+        _restart_cooldown_until = _browser_restart_cooldown_until
+    except Exception as e:
+        logger.error(f"TabManager standby browser recycle failed: {e}")
+
+
 def _tab_manager_maintenance():
-    """Maintenance tick for the TabManager: zombie watchdog, memory-triggered
-    restart, and max-lifetime recycle, plus tab/loop gauges. No-op when the
-    flag is off. Recycle/restart work is offloaded to the recycle executor so
-    this never blocks the background sweep loop."""
-    global _browser_restart_cooldown_until
+    """Maintenance tick for TabManager: 3-tier stall escalation, scheduled/memory
+    triggers, max-lifetime recycle, and observability gauges."""
+    global _browser_restart_cooldown_until, _restart_cooldown_until, _last_periodic_recycle_time
     if _ensure_tab_manager() is None:
         return
     cm = _tab_mgr["cm"]
     router = _tab_mgr["router"]
     now = time.time()
-    # urls are the KEYS of _url_index (primaries); _tabs is id-keyed. Snapshot
-    # both under cm._lock (RLock): the loop thread and recycle worker mutate
-    # these dicts under the same lock, so an unlocked list() can raise
-    # `RuntimeError: dictionary changed size during iteration`.
+
     with cm._lock:
         urls = list(getattr(cm, "_url_index", {}).keys())
+        primaries = {url: cm._tabs[tid] for url, tid in list(cm._url_index.items())
+                     if tid in getattr(cm, "_tabs", {})}
 
-    # 1) Zombie watchdog. Two distinct failure modes:
-    #    a) ALL primaries silent -> the SHARED Chrome is likely dead/hung. A
-    #       per-URL recycle can't help (warming a shadow on a dead browser fails),
-    #       so restart the whole browser — but ONLY when every listener is stale,
-    #       never for a single silent tab (that is the per-URL path below, and is
-    #       also protected by the recycle cooldown to avoid churn).
-    #    b) A single primary silent >60s -> recycle just that tab (zero-drop
-    #       handoff to a fresh shadow keeps serving that url).
-    if urls and all(
+    # All-stale shared-browser watchdog fallback: when ALL primaries are missing/silent >120s
+    if urls and not primaries and all(
         (ts := router.get_last_frame_ts(u)) is None or now - ts > STALE_RESTART_WINDOW_S
         for u in urls
     ):
         if now >= _browser_restart_cooldown_until:
             logger.warning("TabManager: ALL listeners stale; shared Chrome presumed dead; restarting browser")
             _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
+            _restart_cooldown_until = _browser_restart_cooldown_until
             cm.schedule_recycling(urls[0], "all_stale", _restart_all_tabs, cm, router, "all_stale")
-    else:
-        for url in urls:
+        return
+
+    # 1. 3-Tier Escalation Engine for Data Stalls
+    data_stall_timeout = float(os.environ.get("WS_DATA_STALL_TIMEOUT_S", str(WS_DATA_STALL_TIMEOUT_S)))
+    gmgn_grace_period = GMGN_GRACE_PERIOD_S
+
+    stalled_tabs = []
+    for url in urls:
+        tab = primaries.get(url)
+        if tab is None or not _live(tab):
             ts = router.get_last_frame_ts(url)
-            if ts and now - ts > 60:
-                logger.warning(f"TabManager zombie detected for {url}; recycling")
+            if ts and now - ts > data_stall_timeout:
                 cm.schedule_recycling(url, "zombie", _recycle_tab, cm, router, url, "zombie")
+            continue
 
-    # 2) Memory-triggered restart (single-flight, offloaded to recycle worker so
-    #    a slow Chrome restart never blocks the background sweep loop).
-    mem = cm.get_memory_usage_gb()
-    if mem > 1.2:
+        tab_age = (datetime.now() - tab.service_started_at).total_seconds()
+        is_gmgn = "gmgn.ai" in url.lower() or "gmgn" in url.lower()
+
+        # Check GMGN grace period for fresh GMGN tabs
+        if is_gmgn and tab_age < gmgn_grace_period:
+            continue
+
+        # Check if tab has stalled data frames
+        if getattr(tab, "last_data_frame_ts", 0.0) > 0:
+            is_stalled = (now - tab.last_data_frame_ts) > data_stall_timeout
+        else:
+            is_stalled = tab_age > data_stall_timeout
+
+        if is_stalled:
+            stalled_tabs.append((url, tab))
+        else:
+            tab.consecutive_stalls = 0
+
+    import metrics as m
+
+    # Multi-tab stall escalation -> immediate Tier 3
+    if len(stalled_tabs) >= 2:
+        for url, tab in stalled_tabs:
+            m.WS_STALL_ESCALATIONS.labels(url=url, tier="3").inc()
+            tab.consecutive_stalls = max(getattr(tab, "consecutive_stalls", 0), 3)
         if now >= _browser_restart_cooldown_until:
-            logger.warning(f"TabManager memory {mem:.2f}GB >1.2; restarting all tabs")
+            logger.warning(f"TabManager: multiple tabs stalled ({[u for u, _ in stalled_tabs]}); escalating to Tier 3 standby recycle")
             _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
-            cm.schedule_recycling(next(iter(urls), ""), "memory", _restart_all_tabs, cm, router, "memory")
+            _restart_cooldown_until = _browser_restart_cooldown_until
+            cm.schedule_recycling(stalled_tabs[0][0], "stall_tier3", _recycle_browser_standby, cm, router, "stall_tier3")
+    elif len(stalled_tabs) == 1:
+        url, tab = stalled_tabs[0]
+        stalls = getattr(tab, "consecutive_stalls", 0)
+        if stalls == 0:
+            # Tier 1: Soft reload
+            m.WS_STALL_ESCALATIONS.labels(url=url, tier="1").inc()
+            reload_ok = cm.soft_reload_tab(tab.tab_id)
+            if reload_ok:
+                tab.consecutive_stalls = 1
+                logger.info(f"TabManager: Tier 1 soft reload succeeded for {url}")
+            else:
+                # Reload failed -> escalate directly to Tier 2
+                logger.warning(f"TabManager: Tier 1 soft reload failed for {url}; escalating to Tier 2")
+                m.WS_STALL_ESCALATIONS.labels(url=url, tier="2").inc()
+                tab.consecutive_stalls = 2
+                cm.schedule_recycling(url, "stall_tier2", _recycle_tab, cm, router, url, "stall_tier2")
+        elif stalls == 1:
+            # Tier 2: Per-tab recycle
+            m.WS_STALL_ESCALATIONS.labels(url=url, tier="2").inc()
+            tab.consecutive_stalls = 2
+            logger.warning(f"TabManager: Tier 2 tab recycle triggered for {url}")
+            cm.schedule_recycling(url, "stall_tier2", _recycle_tab, cm, router, url, "stall_tier2")
+        else:
+            # Tier 3: Standby browser recycle (consecutive_stalls >= 2)
+            m.WS_STALL_ESCALATIONS.labels(url=url, tier="3").inc()
+            tab.consecutive_stalls += 1
+            if now >= _browser_restart_cooldown_until:
+                logger.warning(f"TabManager: Tier 3 standby recycle triggered for {url}")
+                _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
+                _restart_cooldown_until = _browser_restart_cooldown_until
+                cm.schedule_recycling(url, "stall_tier3", _recycle_browser_standby, cm, router, "stall_tier3")
 
-    # 3) Max-lifetime restart (WS_LISTENER_MAX_LIFETIME_MINUTES, default 180).
+    # 2. Memory-triggered recycling and emergency fallback
+    mem = cm.get_memory_usage_gb()
+    max_memory_mb = float(os.environ.get("WS_CHROME_MAX_MEMORY_MB", str(WS_CHROME_MAX_MEMORY_MB)))
+    max_memory_gb = max_memory_mb / 1024.0
+
+    if mem > 1.6:
+        # Emergency fallback: Fast in-place restart
+        if now >= _browser_restart_cooldown_until:
+            logger.warning(f"TabManager emergency memory {mem:.2f}GB > 1.6GB; performing fast in-place restart")
+            _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
+            _restart_cooldown_until = _browser_restart_cooldown_until
+            cm.schedule_recycling(next(iter(urls), ""), "emergency_memory", _restart_all_tabs, cm, router, "emergency_memory")
+    elif mem > max_memory_gb:
+        # Chrome RSS ceiling: Standby browser zero-drop recycle
+        if now >= _browser_restart_cooldown_until:
+            logger.warning(f"TabManager memory {mem:.2f}GB > ceiling ({max_memory_mb}MB); recycling via standby browser")
+            _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
+            _restart_cooldown_until = _browser_restart_cooldown_until
+            cm.schedule_recycling(next(iter(urls), ""), "memory", _recycle_browser_standby, cm, router, "memory")
+
+    # 3. Scheduled periodic maintenance (default 6-hour timer)
+    recycle_interval_hours = float(os.environ.get("WS_CHROME_RECYCLE_INTERVAL_HOURS", str(WS_CHROME_RECYCLE_INTERVAL_HOURS)))
+    if recycle_interval_hours > 0:
+        periodic_interval_s = recycle_interval_hours * 3600.0
+        if now - _last_periodic_recycle_time >= periodic_interval_s:
+            _last_periodic_recycle_time = now
+            if now >= _browser_restart_cooldown_until:
+                logger.info(f"TabManager periodic {recycle_interval_hours}h timer triggered standby recycle")
+                _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
+                _restart_cooldown_until = _browser_restart_cooldown_until
+                cm.schedule_recycling(next(iter(urls), ""), "scheduled", _recycle_browser_standby, cm, router, "scheduled")
+
+    # 4. Max-lifetime restart (WS_LISTENER_MAX_LIFETIME_MINUTES, default 180)
     max_life_s = utils.get_config_ws_listener_max_lifetime() * 60
     if max_life_s > 0:
         for url in urls:
@@ -357,26 +472,26 @@ def _tab_manager_maintenance():
                 logger.info(f"TabManager max-lifetime reached for {url}; recycling")
                 cm.schedule_recycling(url, "max_lifetime", _recycle_tab, cm, router, url, "max_lifetime")
 
-    # 4) Gauges.
-    import metrics as m
+    # 5. Observability Gauges
     with cm._lock:
-        tabs = list(cm._tabs.values())
+        tabs = list(getattr(cm, "_tabs", {}).values())
         primaries = {url: cm._tabs[tid] for url, tid in list(cm._url_index.items())
-                     if tid in cm._tabs}
+                     if tid in getattr(cm, "_tabs", {})}
     m.WS_TABS_ACTIVE.set(len(tabs))
-    m.WS_TABS_RUNNING.set(sum(1 for t in tabs if t.status == "running"))
+    m.WS_TABS_RUNNING.set(sum(1 for t in tabs if getattr(t, "status", "") == "running"))
     now_dt = datetime.now()
     for t in tabs:
-        age = (now_dt - t.service_started_at).total_seconds()
+        age = (now_dt - t.service_started_at).total_seconds() if hasattr(t, "service_started_at") else 0.0
         m.WS_TAB_AGE.labels(url=t.url, tab_id=t.tab_id).set(age)
-        maxlen = getattr(t.frame_buffer, "maxlen", 2000)
-        if maxlen > 0:
+        maxlen = getattr(t.frame_buffer, "maxlen", 2000) if hasattr(t, "frame_buffer") else 2000
+        if maxlen > 0 and hasattr(t, "frame_buffer"):
             m.WS_FRAME_BUFFER_UTILIZATION.labels(url=t.url).set(len(t.frame_buffer) / maxlen)
+        if hasattr(t, "data_frame_rate"):
+            m.WS_DATA_FRAME_RATE.labels(url=t.url).set(t.data_frame_rate(60.0))
+        if hasattr(t, "control_frame_rate"):
+            m.WS_CONTROL_FRAME_RATE.labels(url=t.url).set(t.control_frame_rate(60.0))
 
-    # Legacy WS_* gauge parity for the new path (quorum A3). Legacy maintains
-    # UPTIME as continuous elapsed seconds, LAST_SEEN as the heartbeat timestamp,
-    # and RUNNING/STATUS as the per-url status census; recompute them here so the
-    # flag-on deployment keeps dashboards accurate.
+    # Legacy WS_* gauge parity
     running = 0
     status_counts = {}
     for url, primary in primaries.items():
@@ -395,7 +510,7 @@ def _tab_manager_maintenance():
     m.WS_LISTENERS_RUNNING.set(running)
     for st in ("starting", "running", "unhealthy"):
         m.WS_LISTENERS_STATUS.labels(status=st).set(status_counts.get(st, 0))
-    m.WS_LOOP_THREAD_ALIVE.set(1 if cm._loop_thread and cm._loop_thread.is_alive() else 0)
+    m.WS_LOOP_THREAD_ALIVE.set(1 if getattr(cm, "_loop_thread", None) and cm._loop_thread.is_alive() else 0)
 
 
 def background_tasks_thread():

@@ -1419,5 +1419,408 @@ class TestChromeRetention(unittest.TestCase):
             uc_init.LIVE_CHROMES.discard(fake)
 
 
+class TestThreeTierStallEscalation(unittest.TestCase):
+    def setUp(self):
+        flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+        flaresolverr._recycle_cooldown_until.clear()
+        flaresolverr._browser_restart_cooldown_until = 0.0
+        flaresolverr._restart_cooldown_until = 0.0
+
+    def tearDown(self):
+        flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+        flaresolverr._recycle_cooldown_until.clear()
+        flaresolverr._browser_restart_cooldown_until = 0.0
+        flaresolverr._restart_cooldown_until = 0.0
+
+    def _setup_context(self, tabs_dict):
+        from chrome_manager import TabState
+        cm = Mock()
+        cm._lock = threading.RLock()
+        cm._url_index = {tab.url: tab.tab_id for tab in tabs_dict.values()}
+        cm._tabs = {tab.tab_id: tab for tab in tabs_dict.values()}
+        cm._loop_thread = None
+        cm._running = True
+        class _Loop:
+            def is_closed(self):
+                return False
+            def is_running(self):
+                return True
+        cm._loop = _Loop()
+        cm.get_memory_usage_gb.return_value = 0.1
+        cm.get_primary_tab.side_effect = lambda u: tabs_dict.get(u)
+        cm.soft_reload_tab.return_value = True
+
+        router = Mock()
+        router.get_last_frame_ts.side_effect = lambda u: tabs_dict[u].last_frame_ts if u in tabs_dict else None
+        flaresolverr._tab_mgr["cm"] = cm
+        flaresolverr._tab_mgr["router"] = router
+        flaresolverr._tab_mgr["service"] = Mock()
+        return cm, router
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_DATA_STALL_TIMEOUT_S': '60.0'}, clear=False)
+    def test_tier1_soft_reload_on_stall_consecutive_zero(self):
+        from chrome_manager import TabState
+        url = "https://mevx.io/?chain=solana"
+        tab = TabState(
+            tab_id="tab_1",
+            url=url,
+            tab=Mock(),
+            target_id="t1",
+            status="running",
+            service_started_at=datetime.now() - timedelta(seconds=300),
+            last_data_frame_ts=time.time() - 100.0,
+            consecutive_stalls=0
+        )
+        cm, router = self._setup_context({url: tab})
+        
+        tier1_val_before = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="1")._value.get()
+        flaresolverr._tab_manager_maintenance()
+        tier1_val_after = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="1")._value.get()
+
+        cm.soft_reload_tab.assert_called_once_with("tab_1")
+        self.assertEqual(tier1_val_after - tier1_val_before, 1)
+        self.assertEqual(tab.consecutive_stalls, 1)
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_DATA_STALL_TIMEOUT_S': '60.0'}, clear=False)
+    def test_tier1_soft_reload_failure_escalates_to_tier2(self):
+        from chrome_manager import TabState
+        url = "https://mevx.io/?chain=solana"
+        tab = TabState(
+            tab_id="tab_1",
+            url=url,
+            tab=Mock(),
+            target_id="t1",
+            status="running",
+            service_started_at=datetime.now() - timedelta(seconds=300),
+            last_data_frame_ts=time.time() - 100.0,
+            consecutive_stalls=0
+        )
+        cm, router = self._setup_context({url: tab})
+        cm.soft_reload_tab.return_value = False
+
+        tier1_before = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="1")._value.get()
+        tier2_before = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="2")._value.get()
+        flaresolverr._tab_manager_maintenance()
+        tier1_after = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="1")._value.get()
+        tier2_after = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="2")._value.get()
+
+        self.assertEqual(tier1_after - tier1_before, 1)
+        self.assertEqual(tier2_after - tier2_before, 1)
+        self.assertEqual(tab.consecutive_stalls, 2)
+        cm.schedule_recycling.assert_called_once_with(url, "stall_tier2", flaresolverr._recycle_tab, cm, router, url, "stall_tier2")
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_DATA_STALL_TIMEOUT_S': '60.0'}, clear=False)
+    def test_tier2_tab_recycle_on_consecutive_stalls_one(self):
+        from chrome_manager import TabState
+        url = "https://mevx.io/?chain=solana"
+        tab = TabState(
+            tab_id="tab_1",
+            url=url,
+            tab=Mock(),
+            target_id="t1",
+            status="running",
+            service_started_at=datetime.now() - timedelta(seconds=300),
+            last_data_frame_ts=time.time() - 100.0,
+            consecutive_stalls=1
+        )
+        cm, router = self._setup_context({url: tab})
+
+        tier2_before = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="2")._value.get()
+        flaresolverr._tab_manager_maintenance()
+        tier2_after = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="2")._value.get()
+
+        self.assertEqual(tier2_after - tier2_before, 1)
+        self.assertEqual(tab.consecutive_stalls, 2)
+        cm.schedule_recycling.assert_called_once_with(url, "stall_tier2", flaresolverr._recycle_tab, cm, router, url, "stall_tier2")
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_DATA_STALL_TIMEOUT_S': '60.0'}, clear=False)
+    def test_tier3_standby_recycle_on_consecutive_stalls_two(self):
+        from chrome_manager import TabState
+        url = "https://mevx.io/?chain=solana"
+        tab = TabState(
+            tab_id="tab_1",
+            url=url,
+            tab=Mock(),
+            target_id="t1",
+            status="running",
+            service_started_at=datetime.now() - timedelta(seconds=300),
+            last_data_frame_ts=time.time() - 100.0,
+            consecutive_stalls=2
+        )
+        cm, router = self._setup_context({url: tab})
+
+        tier3_before = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="3")._value.get()
+        flaresolverr._tab_manager_maintenance()
+        tier3_after = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="3")._value.get()
+
+        self.assertEqual(tier3_after - tier3_before, 1)
+        self.assertEqual(tab.consecutive_stalls, 3)
+        cm.schedule_recycling.assert_called_once_with(url, "stall_tier3", flaresolverr._recycle_browser_standby, cm, router, "stall_tier3")
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_DATA_STALL_TIMEOUT_S': '60.0'}, clear=False)
+    def test_tier3_immediate_on_multiple_stalled_tabs(self):
+        from chrome_manager import TabState
+        url1 = "https://mevx.io/?chain=solana"
+        url2 = "https://mevx.io/?chain=bsc"
+        tab1 = TabState(
+            tab_id="tab_1",
+            url=url1,
+            tab=Mock(),
+            target_id="t1",
+            status="running",
+            service_started_at=datetime.now() - timedelta(seconds=300),
+            last_data_frame_ts=time.time() - 100.0,
+            consecutive_stalls=0
+        )
+        tab2 = TabState(
+            tab_id="tab_2",
+            url=url2,
+            tab=Mock(),
+            target_id="t2",
+            status="running",
+            service_started_at=datetime.now() - timedelta(seconds=300),
+            last_data_frame_ts=time.time() - 100.0,
+            consecutive_stalls=0
+        )
+        cm, router = self._setup_context({url1: tab1, url2: tab2})
+
+        tier3_before1 = metrics.WS_STALL_ESCALATIONS.labels(url=url1, tier="3")._value.get()
+        tier3_before2 = metrics.WS_STALL_ESCALATIONS.labels(url=url2, tier="3")._value.get()
+        flaresolverr._tab_manager_maintenance()
+        tier3_after1 = metrics.WS_STALL_ESCALATIONS.labels(url=url1, tier="3")._value.get()
+        tier3_after2 = metrics.WS_STALL_ESCALATIONS.labels(url=url2, tier="3")._value.get()
+
+        self.assertEqual(tier3_after1 - tier3_before1, 1)
+        self.assertEqual(tier3_after2 - tier3_before2, 1)
+        self.assertGreaterEqual(tab1.consecutive_stalls, 3)
+        self.assertGreaterEqual(tab2.consecutive_stalls, 3)
+        args = cm.schedule_recycling.call_args.args
+        self.assertEqual(args[1], "stall_tier3")
+        self.assertIs(args[2], flaresolverr._recycle_browser_standby)
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_DATA_STALL_TIMEOUT_S': '60.0'}, clear=False)
+    def test_gmgn_grace_period_prevents_premature_stall(self):
+        from chrome_manager import TabState
+        url = "https://gmgn.ai/sol"
+        # Tab created 100s ago (< 180s grace period), no data frame received yet
+        tab = TabState(
+            tab_id="tab_gmgn",
+            url=url,
+            tab=Mock(),
+            target_id="tgmgn",
+            status="running",
+            service_started_at=datetime.now() - timedelta(seconds=100),
+            last_data_frame_ts=0.0,
+            consecutive_stalls=0
+        )
+        cm, router = self._setup_context({url: tab})
+
+        tier1_before = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="1")._value.get()
+        flaresolverr._tab_manager_maintenance()
+        tier1_after = metrics.WS_STALL_ESCALATIONS.labels(url=url, tier="1")._value.get()
+
+        self.assertEqual(tier1_after, tier1_before)
+        cm.soft_reload_tab.assert_not_called()
+        cm.schedule_recycling.assert_not_called()
+
+
+class TestStandbyBrowserSwapIntegration(unittest.TestCase):
+    def setUp(self):
+        flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+        flaresolverr._recycle_cooldown_until.clear()
+        flaresolverr._browser_restart_cooldown_until = 0.0
+        flaresolverr._restart_cooldown_until = 0.0
+
+    def tearDown(self):
+        flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+        flaresolverr._recycle_cooldown_until.clear()
+        flaresolverr._browser_restart_cooldown_until = 0.0
+        flaresolverr._restart_cooldown_until = 0.0
+
+    def test_standby_zero_drop_swap_under_simulated_load(self):
+        from chrome_manager import ChromeManager, TabState
+        from frame_router import FrameRouter
+        import flaresolverr_service as fs
+
+        mgr = ChromeManager(max_tabs=5)
+        mgr._loop = Mock()
+        router = FrameRouter(mgr)
+
+        url1 = "https://mevx.io/?chain=solana"
+        url2 = "https://gmgn.ai/sol"
+
+        # Mock old browser
+        old_browser = Mock()
+        old_browser.stop = Mock()
+        mgr._browser = old_browser
+        old_dir = "/tmp/tabmgr_old_load_test"
+        mgr._shared_browser_user_data_dir = old_dir
+        fs.register_shared_browser_dir(old_dir)
+
+        old_tab1 = TabState(tab_id="old_t1", url=url1, tab=Mock(), target_id="ot1", status="running")
+        old_tab2 = TabState(tab_id="old_t2", url=url2, tab=Mock(), target_id="ot2", status="running")
+        mgr._tabs[old_tab1.tab_id] = old_tab1
+        mgr._tabs[old_tab2.tab_id] = old_tab2
+        mgr._url_index[url1] = old_tab1.tab_id
+        mgr._url_index[url2] = old_tab2.tab_id
+
+        # Stream messages into old tabs
+        now = time.time()
+        for i in range(10):
+            p = f'{{"jsonrpc":"2.0","id":"msg_{i}","result":{{"i":{i}}}}}'
+            old_tab1._handle_frame("webSocketFrameReceived", p, cdp_ts=100.0 + i)
+            old_tab2._handle_frame("webSocketFrameReceived", f'{{"t":"callout_global","data":[{{"uid":"u_{i}"}}]}}', cdp_ts=100.0 + i)
+
+        # Standby browser and tabs
+        standby_browser = Mock()
+        standby_browser.stop = Mock()
+        standby_dir = "/tmp/tabmgr_standby_load_test"
+        fs.register_shared_browser_dir(standby_dir)
+
+        new_tab1 = TabState(tab_id="new_t1", url=url1, tab=Mock(), target_id="nt1", status="running")
+        new_tab2 = TabState(tab_id="new_t2", url=url2, tab=Mock(), target_id="nt2", status="running")
+
+        # Overlapping messages received during warm
+        for i in range(8, 15):
+            p = f'{{"jsonrpc":"2.0","id":"msg_{i}","result":{{"i":{i}}}}}'
+            new_tab1._handle_frame("webSocketFrameReceived", p, cdp_ts=1.0 + i)
+            new_tab2._handle_frame("webSocketFrameReceived", f'{{"t":"callout_global","data":[{{"uid":"u_{i}"}}]}}', cdp_ts=1.0 + i)
+
+        warmed = {url1: new_tab1, url2: new_tab2}
+
+        # Perform standby swap
+        mgr.swap_standby_browser(standby_browser, standby_dir, warmed, router, quiescence_s=0.0)
+
+        # Verify zero-drop buffer merge and dedup
+        drained1 = mgr.drain_tab(url1)
+        self.assertEqual(len(drained1), 15)  # 0..14 unique
+        drained2 = mgr.drain_tab(url2)
+        self.assertEqual(len(drained2), 15)  # 0..14 unique
+
+        self.assertEqual(mgr._url_index[url1], "new_t1")
+        self.assertEqual(mgr._url_index[url2], "new_t2")
+        self.assertIs(mgr._browser, standby_browser)
+
+    def test_recycle_browser_standby_cooldown_and_dispatch(self):
+        cm = Mock()
+        cm.recycle_browser_standby.return_value = True
+        router = Mock()
+        flaresolverr._tab_mgr["cm"] = cm
+        flaresolverr._tab_mgr["router"] = router
+
+        standby_before = metrics.WS_STANDBY_BROWSER_RECYCLES.labels(reason="stall_tier3")._value.get()
+        flaresolverr._recycle_browser_standby(cm, router, "stall_tier3")
+        standby_after = metrics.WS_STANDBY_BROWSER_RECYCLES.labels(reason="stall_tier3")._value.get()
+
+        cm.recycle_browser_standby.assert_called_once_with(router, reason="stall_tier3")
+        self.assertEqual(standby_after - standby_before, 1)
+        self.assertGreater(flaresolverr._browser_restart_cooldown_until, time.time())
+        self.assertEqual(flaresolverr._restart_cooldown_until, flaresolverr._browser_restart_cooldown_until)
+
+
+class TestScheduledAndMemoryTriggers(unittest.TestCase):
+    def setUp(self):
+        flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+        flaresolverr._recycle_cooldown_until.clear()
+        flaresolverr._browser_restart_cooldown_until = 0.0
+        flaresolverr._restart_cooldown_until = 0.0
+        flaresolverr._last_periodic_recycle_time = time.time()
+
+    def tearDown(self):
+        flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+        flaresolverr._recycle_cooldown_until.clear()
+        flaresolverr._browser_restart_cooldown_until = 0.0
+        flaresolverr._restart_cooldown_until = 0.0
+
+    def _setup_context(self, url="https://mevx.io/?chain=solana"):
+        from chrome_manager import TabState
+        tab = TabState(
+            tab_id="tab_1",
+            url=url,
+            tab=Mock(),
+            target_id="t1",
+            status="running",
+            service_started_at=datetime.now() - timedelta(seconds=100),
+            last_data_frame_ts=time.time() - 10.0,
+            consecutive_stalls=0
+        )
+        cm = Mock()
+        cm._lock = threading.RLock()
+        cm._url_index = {url: "tab_1"}
+        cm._tabs = {"tab_1": tab}
+        cm._loop_thread = None
+        cm._running = True
+        class _Loop:
+            def is_closed(self):
+                return False
+            def is_running(self):
+                return True
+        cm._loop = _Loop()
+        cm.get_primary_tab.return_value = tab
+
+        router = Mock()
+        router.get_last_frame_ts.return_value = time.time() - 10.0
+        flaresolverr._tab_mgr["cm"] = cm
+        flaresolverr._tab_mgr["router"] = router
+        flaresolverr._tab_mgr["service"] = Mock()
+        return cm, router, tab
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_CHROME_MAX_MEMORY_MB': '1200'}, clear=False)
+    def test_memory_ceiling_triggers_standby_recycle(self):
+        cm, router, tab = self._setup_context()
+        cm.get_memory_usage_gb.return_value = 1.3  # > 1200MB ceiling, < 1.6GB emergency
+
+        flaresolverr._tab_manager_maintenance()
+
+        args = cm.schedule_recycling.call_args.args
+        self.assertEqual(args[1], "memory")
+        self.assertIs(args[2], flaresolverr._recycle_browser_standby)
+        self.assertEqual(args[5], "memory")
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_CHROME_MAX_MEMORY_MB': '1200'}, clear=False)
+    def test_memory_emergency_triggers_inplace_restart(self):
+        cm, router, tab = self._setup_context()
+        cm.get_memory_usage_gb.return_value = 1.8  # > 1.6GB emergency
+
+        flaresolverr._tab_manager_maintenance()
+
+        args = cm.schedule_recycling.call_args.args
+        self.assertEqual(args[1], "emergency_memory")
+        self.assertIs(args[2], flaresolverr._restart_all_tabs)
+        self.assertEqual(args[5], "emergency_memory")
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_CHROME_RECYCLE_INTERVAL_HOURS': '6.0'}, clear=False)
+    def test_periodic_timer_triggers_standby_recycle(self):
+        cm, router, tab = self._setup_context()
+        cm.get_memory_usage_gb.return_value = 0.2
+        # Set last periodic recycle to 7 hours ago
+        flaresolverr._last_periodic_recycle_time = time.time() - (7 * 3600.0)
+
+        flaresolverr._tab_manager_maintenance()
+
+        args = cm.schedule_recycling.call_args.args
+        self.assertEqual(args[1], "scheduled")
+        self.assertIs(args[2], flaresolverr._recycle_browser_standby)
+        self.assertEqual(args[5], "scheduled")
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)
+    def test_rate_gauges_updated_on_cycle(self):
+        cm, router, tab = self._setup_context()
+        cm.get_memory_usage_gb.return_value = 0.2
+        now = time.time()
+        for i in range(5):
+            tab.data_frame_history.append(now - i)
+            tab.control_frame_history.append(now - i)
+
+        flaresolverr._tab_manager_maintenance()
+
+        data_rate = metrics.WS_DATA_FRAME_RATE.labels(url=tab.url)._value.get()
+        ctrl_rate = metrics.WS_CONTROL_FRAME_RATE.labels(url=tab.url)._value.get()
+
+        self.assertAlmostEqual(data_rate, 5.0 / 60.0, places=3)
+        self.assertAlmostEqual(ctrl_rate, 5.0 / 60.0, places=3)
+
+
 if __name__ == '__main__':
     unittest.main()
+

@@ -164,6 +164,32 @@ WS_LOOP_THREAD_ALIVE = Gauge(
     documentation='1 if ChromeManager event loop thread is alive'
 )
 
+# Phase 2 & Phase 3 Resilient Capture Engine Metrics
+WS_DATA_FRAME_RATE = Gauge(
+    name='flaresolverr_ws_data_frame_rate',
+    documentation='Incoming data frames per second',
+    labelnames=['url']
+)
+WS_CONTROL_FRAME_RATE = Gauge(
+    name='flaresolverr_ws_control_frame_rate',
+    documentation='Incoming control/ping frames per second',
+    labelnames=['url']
+)
+WS_STALL_ESCALATIONS = Counter(
+    name='flaresolverr_ws_stall_escalations_total',
+    documentation='Stall escalation events',
+    labelnames=['url', 'tier']
+)
+WS_STANDBY_BROWSER_RECYCLES = Counter(
+    name='flaresolverr_ws_standby_recycles_total',
+    documentation='Standby browser recycling events',
+    labelnames=['reason']
+)
+WS_STANDBY_HANDOFF_DURATION = Histogram(
+    name='flaresolverr_ws_standby_handoff_duration_seconds',
+    documentation='Duration of standby browser handoff'
+)
+
 
 def serve(port):
     start_http_server(port=port)

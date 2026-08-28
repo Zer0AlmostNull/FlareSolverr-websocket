@@ -5,7 +5,13 @@ from collections import deque
 from unittest import mock
 
 from chrome_manager import TabState
-from frame_router import FrameRouter
+from frame_router import (
+    FrameRouter,
+    extract_semantic_messages,
+    _same_message,
+    _same_message_cross_process,
+    _merge_dedup,
+)
 
 
 def _make_tab_state(url, tab_id="t"):
@@ -345,3 +351,203 @@ class TestFrameRouter(unittest.TestCase):
 
     def test_tab_status_no_tab_returns_failed(self):
         self.assertEqual(self.router.tab_status("nonexistent"), "failed")
+
+    # ---- Semantic Message Extraction & Protocol Tests ----
+
+    def test_extract_semantic_messages_mevx(self):
+        # 1. JSON-RPC ping/pong (control frames -> is_data=False)
+        ping_payload = '{"jsonrpc":"2.0","id":"req-1","method":"ping"}'
+        res = extract_semantic_messages(ping_payload)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0][0], "jsonrpc:id:req-1")
+        self.assertFalse(res[0][2])
+
+        pong_payload = '{"jsonrpc":"2.0","id":"req-2","result":"pong"}'
+        res = extract_semantic_messages(pong_payload)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0][0], "jsonrpc:id:req-2")
+        self.assertFalse(res[0][2])
+
+        # 2. JSON-RPC data responses (is_data=True)
+        data_payload = '{"jsonrpc":"2.0","id":"req-3","result":{"pool":"0xabc","price":1.23}}'
+        res = extract_semantic_messages(data_payload)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0][0], "jsonrpc:id:req-3")
+        self.assertTrue(res[0][2])
+
+        # 3. subscribeFlashPool notification (is_data=True, key contains hash suffix)
+        flash_payload = ('{"jsonrpc":"2.0","method":"subscribeFlashPool",'
+                         '"params":{"poolAddress":"0xpump123","createdAt":1720000000}}')
+        res = extract_semantic_messages(flash_payload)
+        self.assertEqual(len(res), 1)
+        self.assertTrue(res[0][0].startswith("flash:0xpump123:1720000000:"))
+        self.assertEqual(len(res[0][0].split(":")), 4)
+        self.assertTrue(res[0][2])
+
+    def test_extract_semantic_messages_gmgn(self):
+        # 1. Newline-delimited payloads
+        multi_line = (
+            '{"action":"heartbeat"}\n'
+            '{"channel":"public_broadcast","data":[{"ed":{"sig_id":"sig_123"}}]}\n'
+            '{"t":"callout_global","data":[{"uid":"user_1"},{"uid":"user_2"}]}'
+        )
+        res = extract_semantic_messages(multi_line)
+        self.assertEqual(len(res), 3)
+        self.assertEqual(res[0][0], "gmgn:heartbeat:heartbeat")
+        self.assertFalse(res[0][2])
+        self.assertEqual(res[1][0], "gmgn:sig:sig_123")
+        self.assertTrue(res[1][2])
+        self.assertEqual(res[2][0], "gmgn:callout:user_1:user_2")
+        self.assertTrue(res[2][2])
+
+        # 2. public_broadcast array decomposition with multiple items
+        array_payload = (
+            '{"channel":"public_broadcast","data":['
+            '{"ed":{"sig_id":"sig_abc"}},'
+            '{"et":"twitter_watched","ed":{"id":"tw_999"}}'
+            ']}'
+        )
+        res = extract_semantic_messages(array_payload)
+        self.assertEqual(len(res), 2)
+        self.assertEqual(res[0][0], "gmgn:sig:sig_abc")
+        self.assertTrue(res[0][2])
+        self.assertEqual(res[1][0], "gmgn:tw:tw_999")
+        self.assertTrue(res[1][2])
+
+        # 3. route_info
+        route_payload = '{"t":"route_info","d":{"seq":"987654"}}'
+        res = extract_semantic_messages(route_payload)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0][0], "gmgn:route:987654")
+        self.assertFalse(res[0][2])
+
+        # 4. Heartbeats / coin_price / chain_stat
+        self.assertFalse(extract_semantic_messages('{"channel":"major_coin_price","p":"60000"}')[0][2])
+        self.assertFalse(extract_semantic_messages('{"channel":"chain_stat","data":{}}')[0][2])
+        self.assertFalse(extract_semantic_messages('{"ping":12345}')[0][2])
+        self.assertFalse(extract_semantic_messages('{"pong":12345}')[0][2])
+
+        # 5. Keyless fallback
+        plain = extract_semantic_messages('plain-text-msg')
+        self.assertEqual(len(plain), 1)
+        self.assertEqual(plain[0][0], "plain-text-msg")
+        self.assertTrue(plain[0][2])
+
+        ping_str = extract_semantic_messages('ping')
+        self.assertFalse(ping_str[0][2])
+
+    def test_mevx_rapid_pool_notifications_with_hash_suffix_not_collapsed(self):
+        # Two distinct transactions for the same pool within the same integer second
+        # (same poolAddress & createdAt, but different price/tx in payload)
+        p1 = ('{"jsonrpc":"2.0","method":"subscribeFlashPool",'
+              '"params":{"poolAddress":"pump_sol","createdAt":1720000000,"tx":"tx_1","price":1.0}}')
+        p2 = ('{"jsonrpc":"2.0","method":"subscribeFlashPool",'
+              '"params":{"poolAddress":"pump_sol","createdAt":1720000000,"tx":"tx_2","price":1.1}}')
+
+        # Keys have distinct sha256 suffixes
+        k1 = extract_semantic_messages(p1)[0][0]
+        k2 = extract_semantic_messages(p2)[0][0]
+        self.assertNotEqual(k1, k2)
+
+        # Merge must NOT collapse these two distinct transactions (zero-drop guarantee)
+        old = [_raw_frame(p1, "u", cdp_ts=1000.0)]
+        new = [_raw_frame(p2, "u", cdp_ts=1001.0)]
+        merged = _merge_dedup(old, new)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0]["payload"], p1)
+        self.assertEqual(merged[1]["payload"], p2)
+
+        # But identical payload within CDP window IS deduplicated
+        new_dupe = [_raw_frame(p1, "u", cdp_ts=1001.0)]
+        merged_dupe = _merge_dedup(old, new_dupe)
+        self.assertEqual(len(merged_dupe), 1)
+
+    def test_gmgn_newline_batch_unpacking_and_array_dedup(self):
+        batch1 = (
+            '{"channel":"public_broadcast","data":[{"ed":{"sig_id":"sig_100"}}]}\n'
+            '{"channel":"public_broadcast","data":[{"ed":{"sig_id":"sig_101"}}]}'
+        )
+        f1 = _raw_frame(batch1, "u", cdp_ts=1000.0)
+        f2 = _raw_frame(batch1, "u", cdp_ts=1001.0)
+        # Duplicate batch frame delivered to old and new tab is deduped
+        merged = _merge_dedup([f1], [f2])
+        self.assertEqual(len(merged), 1)
+
+    def test_cross_process_dedup_different_cdp_base_clocks(self):
+        # Dual-Chrome Standby Browser handoff:
+        # Chrome A has been running for 6 hours (cdp_ts = 21600.0)
+        # Chrome B just launched (cdp_ts = 0.5)
+        # Both tabs receive the SAME frame at wall-clock time 1700000000.0 and 1700000001.0
+        payload = '{"jsonrpc":"2.0","id":"uuid-cross-proc","result":{"data":"val"}}'
+        frame_chrome_a = {
+            "timestamp": 1700000000.0,
+            "type": "webSocketFrameReceived",
+            "url": "u",
+            "payload": payload,
+            "cdp_ts": 21600.0,
+        }
+        frame_chrome_b = {
+            "timestamp": 1700000001.0,
+            "type": "webSocketFrameReceived",
+            "url": "u",
+            "payload": payload,
+            "cdp_ts": 0.5,
+        }
+
+        # Intra-process (cross_process=False) fails to dedup because cdp_ts difference is huge
+        intra_merged = _merge_dedup([frame_chrome_a], [frame_chrome_b], cross_process=False)
+        self.assertEqual(len(intra_merged), 2)
+
+        # Cross-process (cross_process=True) uses wall-clock timestamps (diff = 1.0s <= 3.0s) -> deduped!
+        cross_merged = _merge_dedup([frame_chrome_a], [frame_chrome_b], cross_process=True)
+        self.assertEqual(len(cross_merged), 1)
+        self.assertEqual(cross_merged[0]["timestamp"], 1700000000.0)
+
+    def test_cross_process_dedup_outside_wall_clock_window_kept(self):
+        # Same key across processes but arrival time differs by > 3.0s -> keep both
+        payload = '{"jsonrpc":"2.0","id":"uuid-same-key","result":{"data":"val"}}'
+        f1 = {"timestamp": 1700000000.0, "payload": payload, "url": "u"}
+        f2 = {"timestamp": 1700000004.0, "payload": payload, "url": "u"}  # diff = 4.0s > 3.0s
+        merged = _merge_dedup([f1], [f2], cross_process=True)
+        self.assertEqual(len(merged), 2)
+
+    def test_cross_process_keyless_fallback(self):
+        # Keyless identical payload within 3.0s wall-clock -> deduped
+        f1 = {"timestamp": 1700000000.0, "payload": "custom-stream-frame", "url": "u"}
+        f2 = {"timestamp": 1700000002.0, "payload": "custom-stream-frame", "url": "u"}
+        merged = _merge_dedup([f1], [f2], cross_process=True)
+        self.assertEqual(len(merged), 1)
+
+        # Keyless with different payloads -> kept
+        f3 = {"timestamp": 1700000002.5, "payload": "different-stream-frame", "url": "u"}
+        merged2 = _merge_dedup([f1], [f3], cross_process=True)
+        self.assertEqual(len(merged2), 2)
+
+        # Keyless with missing timestamps -> kept (zero-drop)
+        f_no_ts = {"payload": "custom-stream-frame", "url": "u"}
+        merged_no_ts = _merge_dedup([f_no_ts], [f_no_ts], cross_process=True)
+        self.assertEqual(len(merged_no_ts), 2)
+
+    def test_zero_drop_boundary_conditions(self):
+        payload = '{"jsonrpc":"2.0","id":"boundary-test","result":{}}'
+
+        # Exact cross-process window boundaries: 3.0s -> deduped, 3.001s -> kept
+        f_base = {"timestamp": 1000.0, "payload": payload, "url": "u"}
+        f_exact = {"timestamp": 1003.0, "payload": payload, "url": "u"}
+        f_past = {"timestamp": 1003.001, "payload": payload, "url": "u"}
+
+        self.assertTrue(_same_message_cross_process(f_base, f_exact))
+        self.assertFalse(_same_message_cross_process(f_base, f_past))
+
+        # Exact intra-process window boundaries: 2.0s -> deduped, 2.001s -> kept
+        f_cdp_base = {"cdp_ts": 100.0, "payload": payload, "url": "u"}
+        f_cdp_exact = {"cdp_ts": 102.0, "payload": payload, "url": "u"}
+        f_cdp_past = {"cdp_ts": 102.001, "payload": payload, "url": "u"}
+
+        self.assertTrue(_same_message(f_cdp_base, f_cdp_exact))
+        self.assertFalse(_same_message(f_cdp_base, f_cdp_past))
+
+        # Empty buffer combinations
+        self.assertEqual(_merge_dedup([], []), [])
+        self.assertEqual(len(_merge_dedup([f_base], [])), 1)
+        self.assertEqual(len(_merge_dedup([], [f_base])), 1)
