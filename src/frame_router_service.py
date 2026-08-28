@@ -28,16 +28,12 @@ class FrameRouterService:
 
     def ensure_and_fetch(self, url: str):
         tab = self.mgr.get_tab(url)
-        if tab is None:
-            # First use: kick off tab creation in the background, report "starting".
-            # If the manager is ALREADY at its primary cap, the background boot
-            # could only fail with MaxTabsReachedError (swallowed in _boot_tab),
-            # leaving the client on a permanent 200 "starting" and spawning a
-            # doomed boot thread on EVERY request for this url. Detect the cap
-            # synchronously so the endpoint's existing 429 handler fires and no
-            # boot thread is spawned. (Racing a concurrent create that frees a
-            # slot a moment later is acceptable: 429 on a full cap is the correct
-            # conservative signal; the next poll after a slot frees proceeds.)
+        if tab is None or getattr(tab, "status", "") == "crashed":
+            if tab is not None and getattr(tab, "status", "") == "crashed":
+                try:
+                    self.mgr.retire_tab(url)
+                except Exception:
+                    pass
             self.mgr.ensure_can_create_primary(url)
             with self._lock:
                 if url not in self._pending:

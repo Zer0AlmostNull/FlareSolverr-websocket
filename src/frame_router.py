@@ -50,10 +50,19 @@ def extract_semantic_messages(payload: str) -> List[Tuple[str, str, bool]]:
     results: List[Tuple[str, str, bool]] = []
 
     for line in lines:
+        if line.lower() in ("ping", "pong", "2", "3"):
+            results.append((line, line, False))
+            continue
+
         obj = _try_json(line)
         if obj is None:
             # Fallback / non-JSON string
             is_ping_pong = line.lower() in ("ping", "pong", "2", "3")
+            results.append((line, line, not is_ping_pong))
+            continue
+
+        if isinstance(obj, (int, float)):
+            is_ping_pong = str(obj) in ("2", "3")
             results.append((line, line, not is_ping_pong))
             continue
 
@@ -64,7 +73,7 @@ def extract_semantic_messages(payload: str) -> List[Tuple[str, str, bool]]:
                 params = obj.get("params") or {}
                 pool = params.get("poolAddress", "")
                 created = params.get("createdAt", "")
-                h = hashlib.sha256(line.encode("utf-8")).hexdigest()[:8]
+                h = hashlib.sha256(line.encode("utf-8", errors="replace")).hexdigest()[:8]
                 key = f"flash:{pool}:{created}:{h}"
                 results.append((key, line, True))
                 continue
@@ -266,16 +275,28 @@ def _merge_dedup(old_frames, new_frames, maxlen=2000, cross_process=False):
     new frames that turn out to be duplicates. Dedup first (dropping only
     genuine duplicates), then trim the merged result to maxlen only if it
     still exceeds the cap (which requires genuinely-new frames)."""
-    same_fn = _same_message_cross_process if cross_process else _same_message
+    window = CROSS_PROCESS_OVERLAP_WINDOW_S if cross_process else CDP_OVERLAP_WINDOW_S
+    ts_field = "timestamp" if cross_process else "cdp_ts"
+
     result = list(old_frames)
-    seen = {_message_key(f): f for f in old_frames}
+    # seen maps key -> (ts_value, frame_dict)
+    seen = {}
+    for f in old_frames:
+        k = _message_key(f)
+        seen[k] = (f.get(ts_field), f)
+
     for f in new_frames:
         k = _message_key(f)
-        prior = seen.get(k)
-        if prior is not None and same_fn(prior, f):
-            continue          # duplicate of a prior frame -> drop
-        seen[k] = f
+        prior_entry = seen.get(k)
+        if prior_entry is not None:
+            prior_ts, prior_frame = prior_entry
+            curr_ts = f.get(ts_field)
+            if prior_ts is not None and curr_ts is not None:
+                if abs(prior_ts - curr_ts) <= window:
+                    continue  # duplicate within proximity window -> drop
+        seen[k] = (f.get(ts_field), f)
         result.append(f)
+
     if len(result) > maxlen:
         result = result[-maxlen:]
     return result
@@ -355,37 +376,28 @@ class FrameRouter:
                 self.mgr.retire_tab_id(new_tab.tab_id)
                 m.WS_RECONNECT_TOTAL.labels(url=url, result="stale").inc()
                 return "stale"
+
             with old_tab.lock:
                 with new_tab.lock:
                     old_frames = list(old_tab.frame_buffer)
                     new_frames = list(new_tab.frame_buffer)
                     old_tab.frame_buffer.clear()
                     new_tab.frame_buffer.clear()
-
-                    # Merge stale (old) frames with fresh (new) frames, dropping
-                    # new frames that re-deliver the tail of the old stream.
-                    # Dedup uses field-level keys when the payload has them
-                    # (mevx jsonrpc id, gmgn channels), else byte-identical
-                    # payload + CDP-ts/clock proximity. Order of old is preserved
-                    # then new. Trim to new tab's buffer maxlen to avoid silent eviction.
                     maxlen = getattr(new_tab.frame_buffer, "maxlen", 2000)
-                    result = self._merge_dedup(old_frames, new_frames, maxlen=maxlen, cross_process=cross_process)
 
-                    new_tab.frame_buffer.extend(result)
-                    new_tab.status = "running"
-                    old_tab.status = "retiring"
+            # Dedup computation executed outside tab locks
+            result = self._merge_dedup(old_frames, new_frames, maxlen=maxlen, cross_process=cross_process)
+
+            with new_tab.lock:
+                new_tab.frame_buffer.extend(result)
+                new_tab.status = "running"
+            old_tab.status = "retiring"
 
             self.mgr.retire_tab_id(old_tab.tab_id)
             # Legacy metric: track handoff as a reconnect
             m.WS_RECONNECT_TOTAL.labels(url=url, result="handoff").inc()
 
-            # Post-close re-drain: the old tab may have received frames between
-            # clearing its buffer and the async close completing. The url now
-            # points at the NEW tab, so drain_tab(url) would only re-clear/re-read
-            # the new tab's buffer (a no-op that also double-counts metrics).
-            # Recover the old tab's trailing frames directly and merge them into
-            # the new primary, deduping so already-promoted frames are not re-leaked
-            # (never re-counting already-fed frames).
+            # Post-close re-drain: recover the old tab's trailing frames and merge
             tail = []
             with old_tab.lock:                          # url_lock -> old.lock
                 if old_tab.frame_buffer:
@@ -394,11 +406,15 @@ class FrameRouter:
             if tail:
                 with new_tab.lock:                      # -> new.lock (order preserved)
                     existing = list(new_tab.frame_buffer)
-                    merged = self._merge_dedup(
-                        existing, tail,
-                        maxlen=getattr(new_tab.frame_buffer, "maxlen", 2000),
-                        cross_process=cross_process,
-                    )
+                    maxlen = getattr(new_tab.frame_buffer, "maxlen", 2000)
+
+                # Merge older tail frames before existing newer frames
+                merged = self._merge_dedup(
+                    tail, existing,
+                    maxlen=maxlen,
+                    cross_process=cross_process,
+                )
+                with new_tab.lock:
                     new_tab.frame_buffer.clear()
                     new_tab.frame_buffer.extend(merged)
             return "success"

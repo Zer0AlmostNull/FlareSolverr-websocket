@@ -33,32 +33,27 @@ async def _launch_browser():
     headless = utils.get_config_headless()
     if not headless:
         utils.start_xvfb_display()          # idempotent; shares existing Xvfb
-    # Unique user_data_dir per manager instance so profile sweepers don't
-    # mistake the shared browser for an orphan.
     user_data_dir = tempfile.mkdtemp(prefix="tabmgr_")
-    # SECURITY FIX 1: sandbox=True by default; allow override via WS_CHROME_SANDBOX env var
-    # (default true). Only disable if Cloudflare validation proves it blocks.
     sandbox = os.environ.get('WS_CHROME_SANDBOX', 'true').lower() == 'true'
-    browser = await uc.start(
-        headless=headless,
-        sandbox=sandbox,
-        user_data_dir=user_data_dir,
-        browser_args=[
-            "--no-first-run",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--window-size=1920,1080",
-            # SECURITY FIX 2: site-per-process for renderer isolation.
-            # nodriver's Config emits `--disable-features=IsolateOrigins,site-per-process`
-            # by default, which would cancel an explicit --site-per-process. Explicitly
-            # re-enable both features so per-site process isolation actually holds.
-            "--site-per-process",
-            "--enable-features=IsolateOrigins,site-per-process",
-        ],
-    )
-    # Store user_data_dir for orphan-sweeper registration
-    _launch_browser.user_data_dir = user_data_dir
-    return browser
+    try:
+        browser = await uc.start(
+            headless=headless,
+            sandbox=sandbox,
+            user_data_dir=user_data_dir,
+            browser_args=[
+                "--no-first-run",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-size=1920,1080",
+                "--site-per-process",
+                "--enable-features=IsolateOrigins,site-per-process",
+            ],
+        )
+        _launch_browser.user_data_dir = user_data_dir
+        return browser
+    except Exception:
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+        raise
 
 
 async def _launch_standby_browser():
@@ -69,34 +64,89 @@ async def _launch_standby_browser():
         utils.start_xvfb_display()
     user_data_dir = tempfile.mkdtemp(prefix="tabmgr_standby_")
     sandbox = os.environ.get('WS_CHROME_SANDBOX', 'true').lower() == 'true'
-    browser = await uc.start(
-        headless=headless,
-        sandbox=sandbox,
-        user_data_dir=user_data_dir,
-        port=0,
-        browser_args=[
-            "--no-first-run",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--blink-settings=imagesEnabled=false",
-            "--window-size=800,600",
-            "--js-flags=--max-old-space-size=256",
-            "--site-per-process",
-            "--enable-features=IsolateOrigins,site-per-process",
-        ],
-    )
-    browser.user_data_dir = user_data_dir
     try:
-        import flaresolverr_service as fs
-        fs.register_shared_browser_dir(user_data_dir)
-    except Exception as e:
-        logger.warning(f"Failed to register standby browser dir: {e}")
-    return browser
+        browser = await uc.start(
+            headless=headless,
+            sandbox=sandbox,
+            user_data_dir=user_data_dir,
+            port=0,
+            browser_args=[
+                "--no-first-run",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--blink-settings=imagesEnabled=false",
+                "--window-size=800,600",
+                "--js-flags=--max-old-space-size=256",
+                "--site-per-process",
+                "--enable-features=IsolateOrigins,site-per-process",
+            ],
+        )
+        browser.user_data_dir = user_data_dir
+        try:
+            import flaresolverr_service as fs
+            fs.register_shared_browser_dir(user_data_dir)
+        except Exception as e:
+            logger.warning(f"Failed to register standby browser dir: {e}")
+        return browser
+    except Exception:
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+        raise
 
 
 async def launch_standby_browser():
     """Top-level coroutine to launch a standby browser."""
     return await _launch_standby_browser()
+
+
+def _is_data_frame_fast(payload: str) -> bool:
+    """Fast-path classification of data vs control frames without JSON parse/hash overhead."""
+    if not payload:
+        return False
+    stripped = payload.strip()
+    if stripped in ("2", "3", "ping", "pong", "PING", "PONG"):
+        return False
+    # Check control / heartbeat markers
+    if '"heartbeat"' in stripped or '"ping"' in stripped or '"pong"' in stripped:
+        return False
+    if '"major_coin_price"' in stripped or '"chain_stat"' in stripped:
+        return False
+    return True
+
+
+class RollingRateCounter:
+    """Zero-allocation 60-second rolling rate counter."""
+    __slots__ = ('_buckets', '_current_sec', '_lock')
+
+    def __init__(self, num_buckets: int = 60):
+        self._buckets = [0] * num_buckets
+        self._current_sec = int(time.time())
+        self._lock = threading.Lock()
+
+    def inc(self, now: float):
+        sec = int(now)
+        with self._lock:
+            if sec != self._current_sec:
+                diff = min(sec - self._current_sec, len(self._buckets))
+                for i in range(diff):
+                    idx = (self._current_sec + 1 + i) % len(self._buckets)
+                    self._buckets[idx] = 0
+                self._current_sec = sec
+            self._buckets[sec % len(self._buckets)] += 1
+
+    def rate(self, window_s: float = 60.0) -> float:
+        if window_s <= 0:
+            return 0.0
+        now = time.time()
+        sec = int(now)
+        with self._lock:
+            if sec != self._current_sec:
+                diff = min(sec - self._current_sec, len(self._buckets))
+                for i in range(diff):
+                    idx = (self._current_sec + 1 + i) % len(self._buckets)
+                    self._buckets[idx] = 0
+                self._current_sec = sec
+            total = sum(self._buckets)
+        return total / window_s
 
 
 @dataclass
@@ -116,6 +166,8 @@ class TabState:
     consecutive_stalls: int = 0
     data_frame_history: deque = field(default_factory=lambda: deque(maxlen=1000))
     control_frame_history: deque = field(default_factory=lambda: deque(maxlen=1000))
+    _data_rate_counter: RollingRateCounter = field(default_factory=RollingRateCounter)
+    _control_rate_counter: RollingRateCounter = field(default_factory=RollingRateCounter)
 
     def data_frame_rate(self, window_s: float = 60.0) -> float:
         """Calculate rolling data frames per second over the specified window."""
@@ -142,14 +194,14 @@ class TabState:
         return count / window_s
 
     def _handle_frame(self, frame_type: str, payload: str, cdp_ts=None):
+        if not isinstance(payload, str):
+            payload = str(payload or "")
         MAX_FRAME_SIZE = 1_000_000
         if len(payload) > MAX_FRAME_SIZE:
             logger.warning(f"Dropping oversized WS frame ({len(payload)} bytes) for {self.url}")
             return
 
-        from frame_router import extract_semantic_messages
-        semantic_msgs = extract_semantic_messages(payload)
-        is_data = any(m[2] for m in semantic_msgs) if semantic_msgs else False
+        is_data = _is_data_frame_fast(payload)
 
         now = time.time()
         msg = {
@@ -169,6 +221,11 @@ class TabState:
             else:
                 self.last_control_frame_ts = now
                 self.control_frame_history.append(now)
+
+        if is_data:
+            self._data_rate_counter.inc(now)
+        else:
+            self._control_rate_counter.inc(now)
 
     def _feed(self, frame_type: str, payload: str, cdp_ts=None):
         self._handle_frame(frame_type, payload, cdp_ts=cdp_ts)
@@ -227,12 +284,15 @@ class ChromeManager:
 
     async def _async_attach_cdp(self, tab_state: TabState):
         tab = tab_state.tab
-        await tab.send(uc.cdp.network.enable())
         try:
+            await asyncio.wait_for(tab.send(uc.cdp.network.enable()), timeout=5.0)
             if hasattr(uc.cdp, "inspector") and hasattr(uc.cdp.inspector, "enable"):
-                await tab.send(uc.cdp.inspector.enable())
+                try:
+                    await asyncio.wait_for(tab.send(uc.cdp.inspector.enable()), timeout=5.0)
+                except Exception:
+                    pass
         except Exception as e:
-            logger.debug(f"Could not enable inspector domain: {e}")
+            logger.debug(f"CDP domain enable error: {e}")
 
         async def on_received(event: uc.cdp.network.WebSocketFrameReceived):
             # event.timestamp is the CDP MonotonicTime, shared by ALL tabs in
@@ -292,10 +352,10 @@ class ChromeManager:
         try:
             tab = tab_state.tab
             await asyncio.wait_for(tab.get(tab_state.url), timeout=10.0)
-            await tab.send(uc.cdp.network.enable())
             try:
+                await asyncio.wait_for(tab.send(uc.cdp.network.enable()), timeout=5.0)
                 if hasattr(uc.cdp, "inspector") and hasattr(uc.cdp.inspector, "enable"):
-                    await tab.send(uc.cdp.inspector.enable())
+                    await asyncio.wait_for(tab.send(uc.cdp.inspector.enable()), timeout=5.0)
             except Exception:
                 pass
             tab_state.status = "running"
@@ -309,9 +369,9 @@ class ChromeManager:
 
     async def _async_close_tab(self, tab_state: TabState):
         try:
-            await tab_state.tab.close()
+            await asyncio.wait_for(tab_state.tab.close(), timeout=5.0)
         except Exception:
-            logger.debug(f"close tab {tab_state.url} (already gone)")
+            logger.debug(f"close tab {tab_state.url} (already gone or timed out)")
 
     async def _async_stop(self):
         if self._browser is not None:
@@ -720,7 +780,10 @@ class ChromeManager:
         # for a url drops it to 0 and shrinks the global count.
         self._recompute_ws_gauges()
         self._sync_url_metrics(tab_state.url)
-        self._call(self._async_close_tab(tab_state))
+        try:
+            self._call(self._async_close_tab(tab_state), timeout=10.0)
+        except Exception:
+            pass
         logger.info(f"ChromeManager: retired tab {tab_id} for {tab_state.url}")
 
     def retire_tab(self, url: str):
@@ -842,11 +905,15 @@ class ChromeManager:
             tab_timeout = min(timeout, 15.0)
             while time.time() - start_ts < tab_timeout:
                 with tab_state.lock:
+                    if tab_state.status == "crashed":
+                        break
                     has_frame = tab_state.last_data_frame_ts > 0 or bool(tab_state.frame_buffer)
                 if has_frame:
+                    tab_state.status = "running"
                     break
                 await asyncio.sleep(0.1)
-            tab_state.status = "running"
+            if tab_state.status != "crashed":
+                tab_state.status = "running"
             return tab_state
 
         for i in range(0, len(urls), concurrency):
@@ -890,7 +957,7 @@ class ChromeManager:
                 if url not in self._url_index:
                     self._url_index[url] = ts.tab_id
 
-        # Perform cross-process buffer merge & dedup
+        # Perform cross-process buffer merge & dedup (snapshot buffers under lock, dedup unlocked)
         for url, old_tab, new_tab in old_tabs_to_retire:
             with old_tab.lock:
                 with new_tab.lock:
@@ -898,12 +965,14 @@ class ChromeManager:
                     new_frames = list(new_tab.frame_buffer)
                     old_tab.frame_buffer.clear()
                     new_tab.frame_buffer.clear()
-
                     maxlen = getattr(new_tab.frame_buffer, "maxlen", 2000)
-                    merged = router._merge_dedup(old_frames, new_frames, maxlen=maxlen, cross_process=True)
-                    new_tab.frame_buffer.extend(merged)
-                    new_tab.status = "running"
-                    old_tab.status = "retiring"
+
+            merged = router._merge_dedup(old_frames, new_frames, maxlen=maxlen, cross_process=True)
+
+            with new_tab.lock:
+                new_tab.frame_buffer.extend(merged)
+                new_tab.status = "running"
+            old_tab.status = "retiring"
 
         # Quiescence window to drain tail frames from old browser tabs
         if quiescence_s > 0:
@@ -918,8 +987,11 @@ class ChromeManager:
             if tail:
                 with new_tab.lock:
                     existing = list(new_tab.frame_buffer)
-                    # Merge older tail frames before existing newer frames to preserve strict chronological ordering
-                    merged = router._merge_dedup(tail, existing, maxlen=getattr(new_tab.frame_buffer, "maxlen", 2000), cross_process=True)
+                    maxlen = getattr(new_tab.frame_buffer, "maxlen", 2000)
+
+                # Merge older tail frames before existing newer frames to preserve strict chronological ordering
+                merged = router._merge_dedup(tail, existing, maxlen=maxlen, cross_process=True)
+                with new_tab.lock:
                     new_tab.frame_buffer.clear()
                     new_tab.frame_buffer.extend(merged)
 

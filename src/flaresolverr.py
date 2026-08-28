@@ -77,7 +77,19 @@ def _manager_broken(cm) -> bool:
     loop = getattr(cm, "_loop", None)
     if loop is None:
         return True
-    return loop.is_closed() or not loop.is_running()
+    if loop.is_closed() or not loop.is_running():
+        return True
+    browser = getattr(cm, "_browser", None)
+    if browser is not None:
+        pid = getattr(browser, "_process_pid", None)
+        if pid:
+            try:
+                import psutil
+                if not psutil.pid_exists(pid):
+                    return True
+            except Exception:
+                pass
+    return False
 
 
 def _ensure_tab_manager():
@@ -279,6 +291,7 @@ def _recycle_tab(cm, router, url, reason):
         _recycle_cooldown_until.pop(url, None)
     except Exception as e:
         logger.error(f"TabManager recycle failed for {url}: {e}")
+        _recycle_cooldown_until[url] = datetime.now() + timedelta(seconds=30)
         m.WS_TAB_HANDOFF_TOTAL.labels(url=url, result="failed").inc()
         m.WS_HANDOFF_DURATION.labels(url=url).observe(time.time() - start)
     finally:
