@@ -429,6 +429,283 @@ class TestWebSocketListenerEndpoints(unittest.TestCase):
         self.assertNotIn("listener_id", res.json)
 
 
+class TestWebSocketMessagesFlag(unittest.TestCase):
+    """Route /websocket_messages through TabManager when WS_TAB_MANAGER_ENABLED,
+    else the legacy WebSocketListenerManager. _ensure_tab_manager() reads the
+    getter at call time (utils.get_config_ws_tab_manager_enabled reads os.environ
+    per call), so env patches take effect per test."""
+
+    def setUp(self):
+        self.app = TestApp(flaresolverr.app)
+        flaresolverr.ws_listener_manager.listeners.clear()
+        flaresolverr.ws_listener_manager._url_index.clear()
+
+    def tearDown(self):
+        flaresolverr.ws_listener_manager.listeners.clear()
+        flaresolverr.ws_listener_manager._url_index.clear()
+        # Reset the lazy singleton between tests so env patches take effect.
+        flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'false'}, clear=False)
+    def test_flag_off_uses_legacy_manager(self):
+        # _ensure_tab_manager() returns None when flag is off -> legacy path.
+        with patch.object(flaresolverr_service.WebSocketListenerManager,
+                          'ensure_and_fetch',
+                          return_value={"status": "running", "messages": []}):
+            res = self.app.get('/websocket_messages?url=https://x.io')
+        self.assertEqual(res.json["status"], "running")
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)
+    def test_flag_on_uses_tab_manager(self):
+        # Inject a stub service into the lazy singleton to prove routing WITHOUT
+        # launching a real Chrome during the unit test.
+        stub = Mock(spec=["ensure_and_fetch"])
+        stub.ensure_and_fetch.return_value = {"status": "running", "messages": []}
+        flaresolverr._tab_mgr["service"] = stub
+        res = self.app.get('/websocket_messages?url=https://x.io')
+        self.assertEqual(res.json["status"], "running")
+        stub.ensure_and_fetch.assert_called_once_with("https://x.io")
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)
+    def test_tab_manager_max_tabs_returns_429(self):
+        # ensure_and_fetch raises MaxTabsReachedError -> 429 response.
+        from chrome_manager import MaxTabsReachedError
+        stub = Mock(spec=["ensure_and_fetch"])
+        stub.ensure_and_fetch.side_effect = MaxTabsReachedError("Max tabs reached")
+        flaresolverr._tab_mgr["service"] = stub
+        res = self.app.get('/websocket_messages?url=https://x.io', expect_errors=True)
+        self.assertEqual(res.status_code, 429)
+        self.assertEqual(res.json["error"], "Max listeners reached")
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)
+    def test_tab_manager_capped_new_url_returns_429_no_boot_thread(self):
+        # A REAL FrameRouterService over a manager already at its primary cap:
+        # ensure_and_fetch must raise synchronously (no doomed boot thread), so
+        # the flag-on endpoint returns 429 instead of a permanent 200 "starting".
+        from chrome_manager import MaxTabsReachedError
+        from frame_router_service import FrameRouterService
+
+        class CappedMgr:
+            max_tabs = 2
+
+            def __init__(self):
+                self._url_index = {"https://a.io": "t1", "https://b.io": "t2"}
+                self.booted = []
+
+            def get_tab(self, url):
+                return None
+
+            def get_primary_tab(self, url):
+                return None
+
+            def ensure_can_create_primary(self, url):
+                if len(self._url_index) >= self.max_tabs:
+                    raise MaxTabsReachedError(f"Max tabs ({self.max_tabs}) reached")
+
+            def create_tab(self, url):
+                self.booted.append(url)
+
+        flaresolverr._tab_mgr["service"] = FrameRouterService(CappedMgr(), Mock())
+        res = self.app.get('/websocket_messages?url=https://c.io', expect_errors=True)
+        self.assertEqual(res.status_code, 429)
+        self.assertEqual(res.json["error"], "Max listeners reached")
+        self.assertEqual(flaresolverr._tab_mgr["service"].mgr.booted, [])
+
+
+class TestTabManagerRecycleCooldown(unittest.TestCase):
+    """B3: _recycle_tab is single-flighted against restart/recover and per-URL
+    cooldowned so a zombie + max_lifetime hit on the same tick can't spawn a
+    leaked running shadow for the same URL."""
+
+    def _failing(self):
+        from chrome_manager import TabState
+        from collections import deque
+        cm = Mock()
+        cm._restart_lock = threading.Lock()
+        tab = TabState(tab_id="t1", url="https://x.io", tab=Mock(), target_id="t",
+                       frame_buffer=deque())
+        tab.status = "starting"
+        cm.get_tab.return_value = tab
+        cm.warm_tab.return_value = tab
+        router = Mock()
+        router.handoff.side_effect = RuntimeError("boom")
+        return cm, router
+
+    def test_cooldown_prevents_same_url_double_submit(self):
+        url = "https://x.io"
+        flaresolverr._recycle_cooldown_until.clear()
+        cm, router = self._failing()
+        try:
+            flaresolverr._recycle_tab(cm, router, url, "zombie")
+            # First recycle failed -> cooldown armed (NOT cleared on failure).
+            self.assertIn(url, flaresolverr._recycle_cooldown_until)
+            warm_calls = cm.warm_tab.call_count
+            # Second recycle of the SAME url on the same tick must be skipped.
+            flaresolverr._recycle_tab(cm, router, url, "max_lifetime")
+            self.assertEqual(cm.warm_tab.call_count, warm_calls)
+            # _restart_lock released after each call (no deadlock on retries).
+            self.assertFalse(cm._restart_lock.locked())
+        finally:
+            flaresolverr._recycle_cooldown_until.clear()
+
+    def test_single_flight_skips_when_restart_in_progress(self):
+        from chrome_manager import TabState
+        from collections import deque
+        url = "https://x.io"
+        flaresolverr._recycle_cooldown_until.clear()
+        cm = Mock()
+        cm._restart_lock = threading.Lock()
+        cm._restart_lock.acquire(blocking=False)   # simulate restart/recover in progress
+        router = Mock()
+        try:
+            flaresolverr._recycle_tab(cm, router, url, "zombie")
+            # warm_tab never called while restart_lock is held.
+            self.assertEqual(cm.warm_tab.call_count, 0)
+        finally:
+            cm._restart_lock.release()
+            flaresolverr._recycle_cooldown_until.clear()
+
+
+class TestTabManagerMaintenance(unittest.TestCase):
+    """Self-heal of a dead manager (quorum C3) and the all-stale shared-browser
+    watchdog (quorum C1 + user directive: restart ONLY when all listeners stale)."""
+
+    def setUp(self):
+        flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+        flaresolverr._recycle_cooldown_until.clear()
+        flaresolverr._browser_restart_cooldown_until = 0.0
+        import metrics as m
+
+    def tearDown(self):
+        flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+        flaresolverr._recycle_cooldown_until.clear()
+        flaresolverr._browser_restart_cooldown_until = 0.0
+
+    def _goal(self, running=True, loop_alive=True):
+        cm = Mock()
+        cm._running = running
+        if loop_alive:
+            class _Loop:
+                def is_closed(self):
+                    return False
+                def is_running(self):
+                    return True
+            cm._loop = _Loop()
+        else:
+            cm._loop = None
+        return cm
+
+    def test_manager_broken_loop_dead(self):
+        # A manager whose loop stopped/was wound down is "broken"; a healthy one
+        # is not; a not-constructed one (None) is never "broken".
+        self.assertFalse(flaresolverr._manager_broken(self._goal(running=True, loop_alive=True)))
+        self.assertTrue(flaresolverr._manager_broken(self._goal(running=False, loop_alive=True)))
+        cm = self._goal(running=True, loop_alive=True)
+        cm._loop = None
+        self.assertTrue(flaresolverr._manager_broken(cm))
+        # Not constructed yet -> not broken (never discard a stub/injected singleton).
+        self.assertFalse(flaresolverr._manager_broken(None))
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)
+    def test_ensure_tab_manager_rebuilds_dead_manager(self):
+        # A cached manager whose loop is dead must be discarded so a fresh manager
+        # is built (never serve a permanently-wedged singleton). Patch the manager
+        # construction + start so no real Chrome launches.
+        class _Loop:
+            def is_closed(self):
+                return False
+            def is_running(self):
+                return True
+
+        class _HealthyCM:
+            def __init__(self, max_tabs):
+                self.max_tabs = max_tabs
+                self._running = True
+                self._loop = _Loop()
+            def start(self):
+                pass
+
+        with patch("chrome_manager.ChromeManager", _HealthyCM):
+            # Inject a broken manager + service.
+            broken = self._goal(running=False)
+            old_service = Mock()
+            flaresolverr._tab_mgr["cm"] = broken
+            flaresolverr._tab_mgr["service"] = old_service
+            svc = flaresolverr._ensure_tab_manager()
+            # Singleton was rebuilt with a fresh, healthy manager.
+            self.assertIsNotNone(svc)
+            self.assertIsNot(flaresolverr._tab_mgr["service"], old_service)
+            self.assertIsInstance(flaresolverr._tab_mgr["cm"], _HealthyCM)
+            self.assertTrue(flaresolverr._tab_mgr["cm"]._running)
+            self.assertFalse(flaresolverr._manager_broken(flaresolverr._tab_mgr["cm"]))
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'false'}, clear=False)
+    def test_manager_broken_none_not_discarded(self):
+        # With the flag off and nothing constructed, _ensure_tab_manager returns
+        # None (legacy path) without building or discarding anything.
+        self.assertIsNone(flaresolverr._ensure_tab_manager())
+
+    def _maintenance_ctx(self, url_index):
+        class _Loop:
+            def is_closed(self):
+                return False
+            def is_running(self):
+                return True
+        cm = Mock()
+        cm._lock = threading.RLock()
+        cm._url_index = url_index
+        cm._tabs = {}
+        cm._loop_thread = None
+        cm._running = True
+        cm._loop = _Loop()
+        cm.get_memory_usage_gb.return_value = 0.1
+        cm.get_primary_tab.return_value = None   # skip max-lifetime body
+        router = Mock()
+        flaresolverr._tab_mgr["cm"] = cm
+        flaresolverr._tab_mgr["router"] = router
+        flaresolverr._tab_mgr["service"] = Mock()
+        flaresolverr._browser_restart_cooldown_until = 0.0
+        return cm
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)
+    def test_maintenance_restarts_browser_when_ALL_listeners_stale(self):
+        # Quorum C1 + user directive: the full browser restart fires only when
+        # EVERY primary listener is stale (shared Chrome presumed dead). Here both
+        # primaries are stale -> schedule a full restart, not per-url recycles.
+        cm = self._maintenance_ctx({"a": "ta", "b": "tb"})
+        STALE = time.time() - 999
+        flaresolverr._tab_mgr["router"].get_last_frame_ts.side_effect = lambda u: STALE
+        try:
+            flaresolverr._tab_manager_maintenance()
+            # A full restart (all_stale) is scheduled on the recycle worker.
+            args = cm.schedule_recycling.call_args.args
+            self.assertIs(args[2], flaresolverr._restart_all_tabs)
+            self.assertEqual(args[1], "all_stale")
+        finally:
+            flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+            flaresolverr._browser_restart_cooldown_until = 0.0
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)
+    def test_maintenance_recycles_single_stale_url_not_full_restart(self):
+        # Only ONE of the two primaries is stale -> recycle just that url (the
+        # shared browser is fine), NOT a full browser restart.
+        cm = self._maintenance_ctx({"a": "ta", "b": "tb"})
+        now = time.time()
+        flaresolverr._tab_mgr["router"].get_last_frame_ts.side_effect = (
+            lambda u: now - 999 if u == "a" else now - 1)
+        try:
+            flaresolverr._tab_manager_maintenance()
+            # Only the stale url gets a per-url zombie recycle.
+            scheduled = [c.args for c in cm.schedule_recycling.call_args_list]
+            self.assertEqual(len(scheduled), 1)
+            self.assertIs(scheduled[0][2], flaresolverr._recycle_tab)
+            self.assertEqual(scheduled[0][5], "a")
+            self.assertEqual(scheduled[0][6], "zombie")
+        finally:
+            flaresolverr._tab_mgr = {"cm": None, "router": None, "service": None}
+            flaresolverr._browser_restart_cooldown_until = 0.0
+
+
 class TestWebSocketMetrics(unittest.TestCase):
     def setUp(self):
         self.manager = flaresolverr_service.WebSocketListenerManager(max_listeners=2)

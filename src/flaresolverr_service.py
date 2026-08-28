@@ -96,6 +96,21 @@ class WebSocketListener:
 
 # WEBSOCKET_MESSAGES: deque[WebsocketMessage] = deque(maxlen=500)
 
+# SECURITY FIX 2: Thread-safe registration for shared browser user_data_dir
+# so orphan sweeper doesn't kill the single-Chrome multi-tab browser.
+_shared_browser_dirs: set = set()
+_shared_dirs_lock = threading.Lock()
+
+def register_shared_browser_dir(path: str):
+    """Register the shared Chrome's user_data_dir with the orphan sweeper."""
+    with _shared_dirs_lock:
+        _shared_browser_dirs.add(path)
+
+def unregister_shared_browser_dir(path: str):
+    """Unregister the shared Chrome's user_data_dir from the orphan sweeper."""
+    with _shared_dirs_lock:
+        _shared_browser_dirs.discard(path)
+
 def _live_user_data_dirs() -> set:
     from flaresolverr import ws_listener_manager
     dirs = set()
@@ -110,6 +125,8 @@ def _live_user_data_dirs() -> set:
                 d = getattr(session.driver, "_fs_user_data_dir", None)
                 if d:
                     dirs.add(d)
+    with _shared_dirs_lock:
+        dirs.update(_shared_browser_dirs)
     return dirs
 
 

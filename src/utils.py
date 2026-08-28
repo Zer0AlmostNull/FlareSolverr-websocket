@@ -358,6 +358,12 @@ def get_config_ws_chrome_v8_heap_mb() -> int:
     return int(os.environ.get('WS_CHROME_V8_HEAP_MB', '1024'))
 
 
+def get_config_ws_tab_manager_enabled() -> bool:
+    """Route /websocket_messages through the new single-Chrome TabManager.
+    Set WS_TAB_MANAGER_ENABLED=false in compose to roll back to WebSocketListenerManager."""
+    return os.environ.get('WS_TAB_MANAGER_ENABLED', 'false').lower() == 'true'
+
+
 def get_flaresolverr_version() -> str:
     global FLARESOLVERR_VERSION
     if FLARESOLVERR_VERSION is not None:

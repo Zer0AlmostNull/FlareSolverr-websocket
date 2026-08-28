@@ -122,6 +122,49 @@ UNQUIT_CHROME_DRIVERS = Gauge(
     documentation='WeakSet-tracked Chrome instances never quit(); should stay flat near listener count')
 
 
+# New tab/lifecycle metrics
+WS_TABS_ACTIVE = Gauge(
+    name='flaresolverr_ws_tabs_active',
+    documentation='Current number of active tabs in the single-Chrome manager'
+)
+WS_TABS_RUNNING = Gauge(
+    name='flaresolverr_ws_tabs_running',
+    documentation='Current number of RUNNING tabs in the single-Chrome manager'
+)
+WS_TAB_HANDOFF_TOTAL = Counter(
+    name='flaresolverr_ws_tab_handoff_total',
+    documentation='Total tab handoffs by result',
+    labelnames=['url', 'result']
+)
+WS_TAB_RESTART_TOTAL = Counter(
+    name='flaresolverr_ws_tab_restart_total',
+    documentation='Total single-Chrome restarts by reason',
+    labelnames=['reason']
+)
+
+# Additional observability metrics from review
+WS_TAB_AGE = Gauge(
+    name='flaresolverr_ws_tab_age_seconds',
+    documentation='Age of tab in seconds',
+    labelnames=['url', 'tab_id']
+)
+WS_FRAME_BUFFER_UTILIZATION = Gauge(
+    name='flaresolverr_ws_frame_buffer_utilization',
+    documentation='Frame buffer utilization (0-1)',
+    labelnames=['url']
+)
+WS_HANDOFF_DURATION = Histogram(
+    name='flaresolverr_ws_handoff_duration_seconds',
+    documentation='Handoff duration in seconds',
+    labelnames=['url'],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+)
+WS_LOOP_THREAD_ALIVE = Gauge(
+    name='flaresolverr_ws_loop_thread_alive',
+    documentation='1 if ChromeManager event loop thread is alive'
+)
+
+
 def serve(port):
     start_http_server(port=port)
     while True:
