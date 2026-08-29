@@ -34,7 +34,7 @@ async def _launch_browser():
     if not headless:
         utils.start_xvfb_display()          # idempotent; shares existing Xvfb
     user_data_dir = tempfile.mkdtemp(prefix="tabmgr_")
-    sandbox = os.environ.get('WS_CHROME_SANDBOX', 'true').lower() == 'true'
+    sandbox = os.environ.get('WS_CHROME_SANDBOX', 'false').lower() == 'true'
     try:
         browser = await uc.start(
             headless=headless,
@@ -63,7 +63,7 @@ async def _launch_standby_browser():
     if not headless:
         utils.start_xvfb_display()
     user_data_dir = tempfile.mkdtemp(prefix="tabmgr_standby_")
-    sandbox = os.environ.get('WS_CHROME_SANDBOX', 'true').lower() == 'true'
+    sandbox = os.environ.get('WS_CHROME_SANDBOX', 'false').lower() == 'true'
     try:
         browser = await uc.start(
             headless=headless,
