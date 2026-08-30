@@ -1820,15 +1820,15 @@ class TestScheduledAndMemoryTriggers(unittest.TestCase):
         return cm, router, tab
 
     @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_CHROME_MAX_MEMORY_MB': '1200'}, clear=False)
-    def test_memory_ceiling_triggers_standby_recycle(self):
+    def test_memory_ceiling_triggers_inplace_restart(self):
         cm, router, tab = self._setup_context()
-        cm.get_memory_usage_gb.return_value = 1.3  # > 1200MB ceiling, < 1.6GB emergency
+        cm.get_memory_usage_gb.return_value = 1.3  # > 1200MB ceiling, < emergency
 
         flaresolverr._tab_manager_maintenance()
 
         args = cm.schedule_recycling.call_args.args
         self.assertEqual(args[1], "memory")
-        self.assertIs(args[2], flaresolverr._recycle_browser_standby)
+        self.assertIs(args[2], flaresolverr._restart_all_tabs)
         self.assertEqual(args[5], "memory")
 
     @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_CHROME_MAX_MEMORY_MB': '1200'}, clear=False)
@@ -1844,7 +1844,7 @@ class TestScheduledAndMemoryTriggers(unittest.TestCase):
         self.assertEqual(args[5], "emergency_memory")
 
     @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true', 'WS_CHROME_RECYCLE_INTERVAL_HOURS': '6.0'}, clear=False)
-    def test_periodic_timer_triggers_standby_recycle(self):
+    def test_periodic_timer_triggers_inplace_restart(self):
         cm, router, tab = self._setup_context()
         cm.get_memory_usage_gb.return_value = 0.2
         # Set last periodic recycle to 7 hours ago
@@ -1854,7 +1854,7 @@ class TestScheduledAndMemoryTriggers(unittest.TestCase):
 
         args = cm.schedule_recycling.call_args.args
         self.assertEqual(args[1], "scheduled")
-        self.assertIs(args[2], flaresolverr._recycle_browser_standby)
+        self.assertIs(args[2], flaresolverr._restart_all_tabs)
         self.assertEqual(args[5], "scheduled")
 
     @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)

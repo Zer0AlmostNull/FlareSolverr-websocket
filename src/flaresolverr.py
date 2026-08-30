@@ -496,12 +496,14 @@ def _tab_manager_maintenance():
         _restart_cooldown_until = _browser_restart_cooldown_until
         cm.schedule_recycling(next(iter(urls), ""), "emergency_memory", _restart_all_tabs, cm, router, "emergency_memory")
     elif mem > max_memory_gb:
-        # Chrome RSS ceiling: Standby browser zero-drop recycle
+        # Chrome RSS ceiling: in-place restart (single Chrome). The standby-swap
+        # peak (~2.4-2.7GB) cannot fit inside the 2048m container cap, so the
+        # ceiling recycles via _restart_all_tabs rather than a second Chrome.
         if now >= _browser_restart_cooldown_until:
-            logger.warning(f"TabManager memory {mem:.2f}GB > ceiling ({max_memory_mb}MB); recycling via standby browser")
+            logger.warning(f"TabManager memory {mem:.2f}GB > ceiling ({max_memory_mb}MB); restarting shared Chrome in place")
             _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
             _restart_cooldown_until = _browser_restart_cooldown_until
-            cm.schedule_recycling(next(iter(urls), ""), "memory", _recycle_browser_standby, cm, router, "memory")
+            cm.schedule_recycling(next(iter(urls), ""), "memory", _restart_all_tabs, cm, router, "memory")
 
     # 3. Scheduled periodic maintenance (default 6-hour timer)
     recycle_interval_hours = float(os.environ.get("WS_CHROME_RECYCLE_INTERVAL_HOURS", str(WS_CHROME_RECYCLE_INTERVAL_HOURS)))
@@ -510,10 +512,10 @@ def _tab_manager_maintenance():
         if now - _last_periodic_recycle_time >= periodic_interval_s:
             _last_periodic_recycle_time = now
             if now >= _browser_restart_cooldown_until:
-                logger.info(f"TabManager periodic {recycle_interval_hours}h timer triggered standby recycle")
+                logger.info(f"TabManager periodic {recycle_interval_hours}h timer triggered shared-Chrome in-place restart")
                 _browser_restart_cooldown_until = now + BROWSER_RESTART_COOLDOWN_S
                 _restart_cooldown_until = _browser_restart_cooldown_until
-                cm.schedule_recycling(next(iter(urls), ""), "scheduled", _recycle_browser_standby, cm, router, "scheduled")
+                cm.schedule_recycling(next(iter(urls), ""), "scheduled", _restart_all_tabs, cm, router, "scheduled")
 
     # 4. Max-lifetime restart (WS_LISTENER_MAX_LIFETIME_MINUTES, default 180)
     max_life_s = utils.get_config_ws_listener_max_lifetime() * 60
