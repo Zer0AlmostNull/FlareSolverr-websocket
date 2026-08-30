@@ -661,6 +661,44 @@ class TestTabManagerMaintenance(unittest.TestCase):
         # None (legacy path) without building or discarding anything.
         self.assertIsNone(flaresolverr._ensure_tab_manager())
 
+    def test_reset_tab_manager_stops_existing_manager(self):
+        cm = Mock()
+        cm._running = True
+        flaresolverr._tab_mgr["cm"] = cm
+        flaresolverr._tab_mgr["router"] = Mock()
+        flaresolverr._tab_mgr["service"] = Mock()
+        flaresolverr._reset_tab_manager()
+        # The old manager must be stopped (loop thread joined, browser closed,
+        # executor shut down) BEFORE refs drop — no orphaned thread/event loop.
+        cm.stop.assert_called_once()
+        self.assertIsNone(flaresolverr._tab_mgr["cm"])
+        self.assertIsNone(flaresolverr._tab_mgr["router"])
+        self.assertIsNone(flaresolverr._tab_mgr["service"])
+
+    @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)
+    def test_ensure_tab_manager_heals_dead_browser_in_place(self):
+        # The prod case: Chrome OS process killed (dead pid) but the manager's
+        # event loop thread is healthy. Heal MUST call restart_browser() on the
+        # SAME manager (single-flight, primaries recreated, leak-free) and keep
+        # the singleton — never discard-and-rebuild (that leaks the loop thread).
+        import psutil
+        dead_pid = 1 << 22
+        while psutil.pid_exists(dead_pid):
+            dead_pid += 1
+        cm = self._goal(running=True, loop_alive=True)
+        cm._browser = Mock()
+        cm._browser._process_pid = dead_pid         # dead pid -> _manager_broken True
+        cm._browser._process = None
+        cm.restart_browser = Mock()
+        old_service = Mock()
+        flaresolverr._tab_mgr["cm"] = cm
+        flaresolverr._tab_mgr["router"] = Mock()
+        flaresolverr._tab_mgr["service"] = old_service
+        svc = flaresolverr._ensure_tab_manager()
+        cm.restart_browser.assert_called_once()
+        self.assertIs(svc, old_service)   # same singleton, not a rebuilt one
+        self.assertIs(flaresolverr._tab_mgr["cm"], cm)
+
     def _maintenance_ctx(self, url_index):
         class _Loop:
             def is_closed(self):

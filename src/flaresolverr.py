@@ -104,7 +104,7 @@ def _ensure_tab_manager():
     # here so the next construction below rebuilds a fresh, working manager
     # instead of returning a permanently-wedged singleton (quorum C3/C1).
     if _manager_broken(_tab_mgr["cm"]):
-        _reset_tab_manager()
+        _heal_tab_manager()
     if _tab_mgr["service"] is not None:
         return _tab_mgr["service"]
     if not utils.get_config_ws_tab_manager_enabled():
@@ -112,7 +112,7 @@ def _ensure_tab_manager():
     with _tab_mgr_init_lock:
         # Re-check inside the lock: a concurrent thread may have rebuilt it.
         if _manager_broken(_tab_mgr["cm"]):
-            _reset_tab_manager()
+            _heal_tab_manager()
         if _tab_mgr["service"] is not None:
             return _tab_mgr["service"]
         from chrome_manager import ChromeManager
@@ -126,7 +126,34 @@ def _ensure_tab_manager():
         return service
 
 
+def _heal_tab_manager():
+    """Heal a "broken" ChromeManager without leaking its loop thread.
+    - Chrome pid dead but event loop alive (the common cgroup-OOM case):
+      restart_browser() in place — leak-free stop/start, primaries recreated,
+      singleton kept, honours _restart_lock (no-op if recycle already in flight).
+    - Event loop itself dead/wound down: proper _reset_tab_manager() so a fresh
+      manager is built; stop() first guarantees no orphaned thread/loop."""
+    cm = _tab_mgr["cm"]
+    if cm is None:
+        return
+    loop = getattr(cm, "_loop", None)
+    if (getattr(cm, "_running", False)
+            and loop is not None and not loop.is_closed() and loop.is_running()):
+        try:
+            cm.restart_browser()
+        except Exception as e:
+            logger.error(f"TabManager: in-place heal failed: {e}")
+    else:
+        _reset_tab_manager()
+
+
 def _reset_tab_manager():
+    cm = _tab_mgr["cm"]
+    if cm is not None:
+        try:
+            cm.stop()   # join loop thread, close browser, shutdown executor -> no leak
+        except Exception as e:
+            logger.warning(f"TabManager: error stopping manager during reset: {e}")
     _tab_mgr["cm"] = None
     _tab_mgr["router"] = None
     _tab_mgr["service"] = None
