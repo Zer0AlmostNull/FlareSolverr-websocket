@@ -593,6 +593,7 @@ class TestTabManagerMaintenance(unittest.TestCase):
             cm._loop = _Loop()
         else:
             cm._loop = None
+        cm._browser = None
         return cm
 
     def test_manager_broken_loop_dead(self):
@@ -605,6 +606,21 @@ class TestTabManagerMaintenance(unittest.TestCase):
         self.assertTrue(flaresolverr._manager_broken(cm))
         # Not constructed yet -> not broken (never discard a stub/injected singleton).
         self.assertFalse(flaresolverr._manager_broken(None))
+
+    def test_manager_broken_process_exited_via_returncode(self):
+        # Chrome's pid may be reused by an unrelated process (pid_exists stays
+        # True) while the browser is actually dead: the returncode probe must
+        # catch it. A running process (returncode None) must NOT be "broken".
+        cm = self._goal(running=True, loop_alive=True)
+        cm._browser = Mock()
+        cm._browser._process_pid = os.getpid()          # pid EXISTS (reuse scenario)
+        cm._browser._process = SimpleNamespace(returncode=0)
+        self.assertTrue(flaresolverr._manager_broken(cm))
+        cm._browser._process = SimpleNamespace(returncode=None)  # genuinely running
+        self.assertFalse(flaresolverr._manager_broken(cm))
+        # No _process handle at all -> not broken via this probe (pid lives).
+        cm._browser._process = None
+        self.assertFalse(flaresolverr._manager_broken(cm))
 
     @patch.dict('os.environ', {'WS_TAB_MANAGER_ENABLED': 'true'}, clear=False)
     def test_ensure_tab_manager_rebuilds_dead_manager(self):

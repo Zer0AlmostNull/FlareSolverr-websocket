@@ -89,6 +89,11 @@ def _manager_broken(cm) -> bool:
                     return True
             except Exception:
                 pass
+        # Secondary probe (guards pid-reuse): an exited subprocess._process has a
+        # non-None returncode even if its pid got recycled by another process.
+        proc = getattr(browser, "_process", None)
+        if proc is not None and getattr(proc, "returncode", None) is not None:
+            return True
     return False
 
 
