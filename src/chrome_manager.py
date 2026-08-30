@@ -47,6 +47,7 @@ async def _launch_browser():
                 "--window-size=1920,1080",
                 "--site-per-process",
                 "--enable-features=IsolateOrigins,site-per-process",
+                f"--js-flags=--max-old-space-size={utils.get_config_ws_chrome_v8_heap_mb()}",
             ],
         )
         _launch_browser.user_data_dir = user_data_dir

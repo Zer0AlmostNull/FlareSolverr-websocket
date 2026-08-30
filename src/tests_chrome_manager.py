@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 from collections import deque
 
+import chrome_manager
 from chrome_manager import ChromeManager, TabState
 
 
@@ -333,6 +334,19 @@ class TestChromeManager(unittest.TestCase):
         mgr = self._make_manager()
         ok = mgr.soft_reload_tab("nonexistent_id")
         self.assertFalse(ok)
+
+    def test_launch_browser_applies_v8_heap_flag(self):
+        captured = {}
+        fake_browser = mock.Mock()
+        async def fake_start(**kwargs):
+            captured.update(kwargs)
+            return fake_browser
+        with mock.patch("chrome_manager.uc.start", side_effect=fake_start):
+            with mock.patch.dict('os.environ', {'WS_CHROME_V8_HEAP_MB': '768'}, clear=False):
+                browser = asyncio.run(chrome_manager._launch_browser())
+                self.assertIs(browser, fake_browser)
+        args = captured["browser_args"]
+        self.assertIn("--js-flags=--max-old-space-size=768", args)
 
     def test_cdp_detached_and_target_crashed_handlers_set_status_crashed(self):
         import nodriver as uc
