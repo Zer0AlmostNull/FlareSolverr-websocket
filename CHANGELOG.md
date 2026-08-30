@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026-08-30] fix: heal ChromeManager in place instead of discard-rebuild
+- `_ensure_tab_manager` now heals a dead-pid/live-loop manager via `cm.restart_browser()` (singleton kept), and `_reset_tab_manager()` stop()s the old manager before clearing refs — no orphaned loop threads/event loops/Chrome objects
+- `_manager_broken` reports broken when `browser._process.returncode` is set (pid-reuse guard)
+- Memory-ceiling and periodic recycle triggers now use single-Chrome in-place restart (`_restart_all_tabs`); standby-swap recycle retained but not scheduled (needs >2GB cap)
+- Shared Chrome V8 heap capped via `WS_CHROME_V8_HEAP_MB`
+
 ## [2026-08-29] resilient multi-tab capture, 3-tier stall escalation & standby zero-drop recycling
 * **Protocol-Aware Deduplication & Batch Decomposition (`frame_router.py`)**:
   - Implemented `extract_semantic_messages()` to unpack newline-delimited (`\n`) JSON payloads and decompose `public_broadcast` arrays into discrete entity keys (`gmgn:sig:{sig_id}`, `gmgn:tw:{id}`, `gmgn:callout:{uids}`).
