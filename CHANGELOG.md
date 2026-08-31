@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026-08-31] fix(docker): pin chromium to 151.0.7922.173-1~deb12u1 + upgrade nodriver 0.48.1 -> 0.50.3
+- Root cause: unpinned apt `chromium` floated to 151 on rebuild while `nodriver==0.48.1` still read pre-146 CDP field names -> `KeyError: 'privateNetworkRequestPolicy'` / `KeyError: 'sameParty'` on every `Network.requestWillBeSentExtraInfo` (event pipeline drops -> stale listeners -> restart loop -> Cloudflare `Blocked` fetches)
+- Upgrade `nodriver` 0.48.1 -> 0.50.3: `ClientSecurityState.from_json` reads `localNetworkAccessRequestPolicy` (Chrome 146+ rename) and `Cookie` no longer requires `sameParty`
+- Pin `chromium`/`chromium-common`/`chromium-driver` to `151.0.7922.173-1~deb12u1` (verified pair w/ nodriver 0.50.3)
+- Verified: 0.48.1 reproduces KeyError storm (73+25), 0.50.3 yields zero KeyErrors + live WS frame capture; pytest 141 passed (2 pre-existing memory-gauge assertions fail identically on the 0.48.1 baseline)
+
 ## [2026-08-30] fix: heal ChromeManager in place instead of discard-rebuild
 - `_ensure_tab_manager` now heals a dead-pid/live-loop manager via `cm.restart_browser()` (singleton kept), and `_reset_tab_manager()` stop()s the old manager before clearing refs — no orphaned loop threads/event loops/Chrome objects
 - `_manager_broken` reports broken when `browser._process.returncode` is set (pid-reuse guard)

@@ -29,7 +29,14 @@ RUN dpkg -i /libgl1-mesa-dri.deb \
     && dpkg -i /adwaita-icon-theme.deb \
     # Install dependencies
     && apt-get update \
-    && apt-get install -y --no-install-recommends chromium chromium-common chromium-driver xvfb dumb-init \
+    # Chromium pinned to a version whose CDP field names match my pinned nodriver
+    # (>=130 must ship localNetworkAccessRequestPolicy; the pair is verified, see
+    # CHANGELOG). Bump together with requirements.txt.
+    && apt-get install -y --no-install-recommends \
+        chromium=151.0.7922.173-1~deb12u1 \
+        chromium-common=151.0.7922.173-1~deb12u1 \
+        chromium-driver=151.0.7922.173-1~deb12u1 \
+        xvfb dumb-init \
         procps curl vim xauth \
     # Remove temporary files and hardware decoding libraries
     && rm -rf /var/lib/apt/lists/* \
